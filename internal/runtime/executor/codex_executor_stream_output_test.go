@@ -529,6 +529,112 @@ func TestCodexTerminalStreamErrHandlesUsageLimitResponseFailed(t *testing.T) {
 	}
 }
 
+func TestCodexExecutorExecuteStreamFallbackChunksSurviveScannerReuse(t *testing.T) {
+	created := []byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-sol"}}`)
+	completed := []byte(`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.6-sol","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+	stream := append(append(append([]byte{}, created...), '\n'), completed...)
+	stream = append(stream, '\n')
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(bytes.NewReader(stream)),
+			Request:    req,
+		}, nil
+	}))
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": "http://codex.test",
+		"api_key":  "test",
+	}}
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatCodex,
+		ResponseFormat: sdktranslator.FormatCodex,
+		Stream:         true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var payloads [][]byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		payloads = append(payloads, chunk.Payload)
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("payload count = %d, want 2", len(payloads))
+	}
+	if !bytes.Equal(payloads[0], created) {
+		t.Fatalf("first fallback payload changed after scanner reuse: got %q want %q", payloads[0], created)
+	}
+}
+
+func TestCodexStreamLineForTranslationOwnership(t *testing.T) {
+	line := []byte("data: benchmark")
+	cloned := codexStreamLineForTranslation(line, false)
+	line[0] = 'X'
+	if cloned[0] == 'X' {
+		t.Fatal("fallback translation input aliases scanner buffer")
+	}
+
+	direct := codexStreamLineForTranslation(line, true)
+	direct[0] = 'Y'
+	if line[0] != 'Y' {
+		t.Fatal("native translation input should reuse scanner buffer")
+	}
+}
+
+func TestCodexToClaudeStreamTranslationDetachesOutput(t *testing.T) {
+	if !canTranslateCodexStreamLineWithoutClone(sdktranslator.FormatCodex, sdktranslator.FormatClaude) {
+		t.Fatal("native Codex-to-Claude stream transformer is not registered")
+	}
+	input := []byte(`data: {"type":"response.output_text.delta","delta":"hello"}`)
+	var param any
+	chunks := sdktranslator.TranslateStream(
+		context.Background(),
+		sdktranslator.FormatCodex,
+		sdktranslator.FormatClaude,
+		"gpt-5.6-sol",
+		[]byte(`{"messages":[]}`),
+		nil,
+		input,
+		&param,
+	)
+	if len(chunks) == 0 {
+		t.Fatal("native Codex-to-Claude stream transformer returned no chunks")
+	}
+	want := make([][]byte, len(chunks))
+	for i := range chunks {
+		want[i] = bytes.Clone(chunks[i])
+	}
+	for i := range input {
+		input[i] = 'X'
+	}
+	for i := range chunks {
+		if !bytes.Equal(chunks[i], want[i]) {
+			t.Fatalf("translated chunk %d changed after input reuse: got %q want %q", i, chunks[i], want[i])
+		}
+	}
+}
+
+func TestCanTranslateCodexStreamLineWithoutCloneRejectsFallbackFormats(t *testing.T) {
+	for _, downstream := range []sdktranslator.Format{
+		sdktranslator.FormatCodex,
+		sdktranslator.FormatOpenAI,
+		sdktranslator.FormatOpenAIResponse,
+	} {
+		if canTranslateCodexStreamLineWithoutClone(sdktranslator.FormatCodex, downstream) {
+			t.Fatalf("downstream format %q must retain defensive clone", downstream)
+		}
+	}
+}
+
 func statusCodeFromTestError(t *testing.T, err error) int {
 	t.Helper()
 
