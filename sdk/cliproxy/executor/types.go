@@ -147,6 +147,9 @@ type StreamResult struct {
 	Headers http.Header
 	// Chunks is the channel of streaming payload units.
 	Chunks <-chan StreamChunk
+	// UpstreamAccepted reports that the provider accepted the request before streaming began.
+	// Failures after this point must not replay the request, even if no payload reached the client.
+	UpstreamAccepted bool
 }
 
 // StatusError represents an error that carries an HTTP-like status code.

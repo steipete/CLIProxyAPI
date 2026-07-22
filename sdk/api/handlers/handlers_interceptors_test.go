@@ -861,6 +861,80 @@ func TestHandlerStreamInterceptorKeepsReturnedHeadersStableAfterFirstPayload(t *
 	}
 }
 
+func TestHandlerStreamInterceptorKeepsHeadersMutableAcrossDroppedFirstChunk(t *testing.T) {
+	model := "handler-interceptor-stream-dropped-first-header-model"
+	firstConsumed := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk)
+			go func() {
+				defer close(chunks)
+				chunks <- coreexecutor.StreamChunk{Payload: []byte("drop")}
+				close(firstConsumed)
+				<-releaseSecond
+				chunks <- coreexecutor.StreamChunk{Payload: []byte("forward")}
+			}()
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": {"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			headers := cloneHeader(req.ResponseHeaders)
+			switch req.ChunkIndex {
+			case pluginapi.StreamChunkHeaderInitIndex:
+				headers.Set("X-Stage", "init")
+				return pluginapi.StreamChunkInterceptResponse{Headers: headers}
+			case 0:
+				headers.Set("X-Chunk", "dropped")
+				return pluginapi.StreamChunkInterceptResponse{Headers: headers, DropChunk: true}
+			default:
+				headers.Set("X-Chunk", "forwarded")
+				return pluginapi.StreamChunkInterceptResponse{Headers: headers, Body: cloneBytes(req.Body)}
+			}
+		},
+	})
+
+	type streamResult struct {
+		dataChan        <-chan []byte
+		upstreamHeaders http.Header
+		errChan         <-chan *interfaces.ErrorMessage
+	}
+	resultChan := make(chan streamResult, 1)
+	go func() {
+		dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+		resultChan <- streamResult{dataChan: dataChan, upstreamHeaders: upstreamHeaders, errChan: errChan}
+	}()
+
+	<-firstConsumed
+	select {
+	case result := <-resultChan:
+		t.Fatalf("stream returned before a non-dropped payload: %#v", result.upstreamHeaders)
+	default:
+	}
+	close(releaseSecond)
+	result := <-resultChan
+	if got := result.upstreamHeaders.Get("X-Chunk"); got != "forwarded" {
+		t.Fatalf("X-Chunk = %q, want forwarded; headers=%#v", got, result.upstreamHeaders)
+	}
+	var payload []byte
+	for chunk := range result.dataChan {
+		payload = append(payload, chunk...)
+	}
+	for msg := range result.errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if string(payload) != "forward" {
+		t.Fatalf("payload = %q, want forward", payload)
+	}
+}
+
 func TestHandlerStreamInterceptorInitializesHeadersWithoutPayload(t *testing.T) {
 	model := "handler-interceptor-stream-header-only-model"
 	executor := &interceptorCaptureExecutor{

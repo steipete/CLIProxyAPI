@@ -364,6 +364,9 @@ func TestCodexExecutorExecuteStreamIgnoresTransportErrorAfterCompletion(t *testi
 	if err != nil {
 		t.Fatalf("ExecuteStream error: %v", err)
 	}
+	if !result.UpstreamAccepted {
+		t.Fatal("expected successful Codex HTTP response to mark stream accepted")
+	}
 
 	var streamErr error
 	for chunk := range result.Chunks {
