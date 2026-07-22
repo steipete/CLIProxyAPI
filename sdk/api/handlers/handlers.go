@@ -1707,7 +1707,7 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	}
 
 	if len(providers) == 0 {
-		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
+		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: &UnknownModelError{Model: modelName}}
 	}
 
 	// The thinking suffix is preserved in the model name itself, so no
