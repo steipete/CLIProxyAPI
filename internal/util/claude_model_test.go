@@ -64,6 +64,22 @@ func TestEnsureClaudeModelIDPrefix(t *testing.T) {
 	}
 }
 
+func TestCanonicalClaudeModelID(t *testing.T) {
+	tests := map[string]string{
+		" Claude-Fable-5 ":                   "claude-fable-5",
+		"claude-fable-5[1m]":                 "claude-fable-5",
+		"claude-opus-4-8[1M](high)":          "claude-opus-4-8",
+		"claude-fable-5-internal":            "claude-fable-5-internal",
+		"claude-fable-5-dd-o4-tpg(high)":     "gpt-4o",
+		"claude-fable-5-dd-lanretni-5-elbaf": "fable-5-internal",
+	}
+	for input, want := range tests {
+		if got := CanonicalClaudeModelID(input); got != want {
+			t.Fatalf("CanonicalClaudeModelID(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestResolveClaudeModelIDPrefix(t *testing.T) {
 	tests := []struct {
 		name string

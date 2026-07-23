@@ -1156,6 +1156,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		if errValidate := helps.ValidateClaudeRequestForCodex(req.Payload); errValidate != nil {
+			return resp, errValidate
+		}
+	}
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("codex")
 	originalPayloadSource := req.Payload
@@ -1441,6 +1446,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		if errValidate := helps.ValidateClaudeRequestForCodex(req.Payload); errValidate != nil {
+			return nil, errValidate
+		}
+	}
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("codex")
 	originalPayloadSource := req.Payload
@@ -1624,6 +1634,11 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
+	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		if errValidate := helps.ValidateClaudeRequestForCodex(req.Payload); errValidate != nil {
+			return cliproxyexecutor.Response{}, errValidate
+		}
+	}
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("codex")
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
@@ -1686,6 +1701,33 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 
 	root := gjson.ParseBytes(body)
 	var segments []string
+	var structuralTokens int64
+	appendContentParts := func(content gjson.Result) error {
+		if !content.IsArray() {
+			return nil
+		}
+		parts := content.Array()
+		for i := range parts {
+			part := parts[i]
+			switch part.Get("type").String() {
+			case "input_image", "input_file":
+				// Media token cost is model- and content-dependent (image tiling,
+				// PDF text plus page images); any local heuristic under- or
+				// overreports badly. Fail request-scoped until counting routes
+				// through the exact POST /v1/responses/input_tokens endpoint.
+				return &cliproxyexecutor.RequestError{
+					HTTPStatus: http.StatusBadRequest,
+					Code:       "invalid_request_error",
+					Message:    "routed token counting does not support image or document inputs",
+				}
+			default:
+				if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+					segments = append(segments, text)
+				}
+			}
+		}
+		return nil
+	}
 
 	if inst := strings.TrimSpace(root.Get("instructions").String()); inst != "" {
 		segments = append(segments, inst)
@@ -1696,17 +1738,11 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 		arr := inputItems.Array()
 		for i := range arr {
 			item := arr[i]
+			structuralTokens += 4
 			switch item.Get("type").String() {
 			case "message":
-				content := item.Get("content")
-				if content.IsArray() {
-					parts := content.Array()
-					for j := range parts {
-						part := parts[j]
-						if text := strings.TrimSpace(part.Get("text").String()); text != "" {
-							segments = append(segments, text)
-						}
-					}
+				if err := appendContentParts(item.Get("content")); err != nil {
+					return 0, err
 				}
 			case "function_call":
 				if name := strings.TrimSpace(item.Get("name").String()); name != "" {
@@ -1716,7 +1752,12 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 					segments = append(segments, args)
 				}
 			case "function_call_output":
-				if out := strings.TrimSpace(item.Get("output").String()); out != "" {
+				output := item.Get("output")
+				if output.IsArray() {
+					if err := appendContentParts(output); err != nil {
+						return 0, err
+					}
+				} else if out := strings.TrimSpace(output.String()); out != "" {
 					segments = append(segments, out)
 				}
 			default:
@@ -1732,6 +1773,7 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 		tarr := tools.Array()
 		for i := range tarr {
 			tool := tarr[i]
+			structuralTokens += 8
 			if name := strings.TrimSpace(tool.Get("name").String()); name != "" {
 				segments = append(segments, name)
 			}
@@ -1767,15 +1809,15 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 	}
 
 	text := strings.Join(segments, "\n")
-	if text == "" {
-		return 0, nil
+	textTokens := int64(0)
+	if text != "" {
+		count, err := enc.Count(text)
+		if err != nil {
+			return 0, err
+		}
+		textTokens = int64(count)
 	}
-
-	count, err := enc.Count(text)
-	if err != nil {
-		return 0, err
-	}
-	return int64(count), nil
+	return textTokens + structuralTokens, nil
 }
 
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
