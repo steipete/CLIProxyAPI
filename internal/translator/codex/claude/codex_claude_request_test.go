@@ -1028,3 +1028,42 @@ func TestConvertClaudeRequestToCodex_ExplicitEffortSurvivesWithoutThinking(t *te
 		}
 	}
 }
+
+func TestConvertClaudeRequestToCodex_ConnectorTextFallbackBoundary(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-fable-5",
+		"messages":[
+			{"role":"assistant","content":[
+				{"type":"connector_text","text":"pre-fallback narration"},
+				{"type":"tool_use","id":"call_dropped","name":"never_ran","input":{}},
+				{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"}},
+				{"type":"connector_text","text":"post-fallback narration"},
+				{"type":"text","text":"answer"}
+			]},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	flat := result.Get("input").Raw
+	if strings.Contains(flat, "pre-fallback narration") {
+		t.Fatalf("pre-fallback connector_text must be dropped: %s", flat)
+	}
+	if strings.Contains(flat, "call_dropped") {
+		t.Fatalf("pre-fallback client tool_use must be dropped: %s", flat)
+	}
+	if !strings.Contains(flat, "post-fallback narration") {
+		t.Fatalf("post-fallback connector_text must be retained: %s", flat)
+	}
+	// Without any fallback block, narration between tool calls is ordinary text.
+	plain := []byte(`{
+		"model":"claude-fable-5",
+		"messages":[
+			{"role":"assistant","content":[{"type":"connector_text","text":"between tool calls"}]},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+	result = gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", plain, false))
+	if !strings.Contains(result.Get("input").Raw, "between tool calls") {
+		t.Fatalf("connector_text without fallback must be retained: %s", result.Get("input").Raw)
+	}
+}

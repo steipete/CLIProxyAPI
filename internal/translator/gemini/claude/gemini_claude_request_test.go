@@ -235,11 +235,13 @@ func TestConvertClaudeRequestToGemini_ErrorToolResultPreservesRawResult(t *testi
 	}`)
 	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
 	response := gjson.GetBytes(output, "contents.1.parts.0.functionResponse.response")
-	if response.Get("result.error").String() != "timeout" || !response.Get("result.retryable").Bool() {
-		t.Fatalf("raw result changed: %s", response.Raw)
+	// Error results route through the contract's "error" key; a sibling
+	// "result" would stop counting as output once "error" is present.
+	if response.Get("error.error").String() != "timeout" || !response.Get("error.retryable").Bool() {
+		t.Fatalf("error payload not in error channel: %s", response.Raw)
 	}
-	if !response.Get("error").Bool() {
-		t.Fatalf("error marker missing: %s", response.Raw)
+	if response.Get("result").Exists() {
+		t.Fatalf("failed tool result must not keep a result key: %s", response.Raw)
 	}
 }
 

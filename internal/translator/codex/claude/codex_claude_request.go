@@ -170,6 +170,15 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 
 			if messageContentsResult.IsArray() {
 				messageContentResults := messageContentsResult.Array()
+				// Fallback replay contract: connector_text narration before the final
+				// fallback block is model-internal and dropped; after that boundary
+				// (or in turns without fallback) it is ordinary assistant text.
+				lastFallbackIndex := -1
+				for j := 0; j < len(messageContentResults); j++ {
+					if messageContentResults[j].Get("type").String() == "fallback" {
+						lastFallbackIndex = j
+					}
+				}
 				for j := 0; j < len(messageContentResults); j++ {
 					messageContentResult := messageContentResults[j]
 					contentType := messageContentResult.Get("type").String()
@@ -177,8 +186,17 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					switch contentType {
 					case "text":
 						appendTextContent(messageContentResult.Get("text").String())
+					case "connector_text":
+						if j > lastFallbackIndex {
+							appendTextContent(messageContentResult.Get("text").String())
+						}
 					case "thinking":
-						appendReasoningContent(messageContentResult)
+						// Pre-final-fallback thinking is invalidated by the fallback
+						// contract just like connector_text; only post-boundary
+						// reasoning may replay.
+						if j > lastFallbackIndex {
+							appendReasoningContent(messageContentResult)
+						}
 					case "redacted_thinking", "fallback":
 						// These are model-internal history markers. They must be accepted on
 						// replay but cannot be translated into a valid GPT reasoning signature.
@@ -239,6 +257,11 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 							appendDocumentContent("file_data", fmt.Sprintf("data:%s;base64,%s", claudeMediaType(sourceResult), data), messageContentResult.Get("title").String())
 						}
 					case "tool_use":
+						// Client tool calls before the final fallback block were never
+						// executed; the replay contract drops them.
+						if j < lastFallbackIndex {
+							break
+						}
 						flushMessage()
 						functionCallMessage := []byte(`{"type":"function_call"}`)
 						functionCallMessage, _ = sjson.SetBytes(functionCallMessage, "call_id", shortenCodexCallIDIfNeeded(messageContentResult.Get("id").String()))

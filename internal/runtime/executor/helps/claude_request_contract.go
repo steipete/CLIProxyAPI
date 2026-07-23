@@ -27,7 +27,7 @@ func ValidateClaudeRequestForCodex(rawJSON []byte) error {
 			for blockIndex, block := range content.Array() {
 				blockType := block.Get("type").String()
 				switch blockType {
-				case "text", "thinking", "redacted_thinking", "tool_use", "compaction", "fallback":
+				case "text", "thinking", "redacted_thinking", "tool_use", "compaction", "fallback", "connector_text":
 				case "server_tool_use":
 					if block.Get("name").String() != "web_search" {
 						return requestContractError("messages.%d.content.%d: unsupported Claude server tool %q for Codex", messageIndex, blockIndex, block.Get("name").String())
