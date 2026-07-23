@@ -55,6 +55,7 @@ const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authe
 
 var corsExposedResponseHeaders = []string{
 	logging.CPATraceIDHeader,
+	"request-id",
 	"X-CPA-VERSION",
 	"X-CPA-COMMIT",
 	"X-CPA-BUILD-DATE",
@@ -2016,6 +2017,10 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		statusCode := err.HTTPStatusCode()
 		if statusCode >= http.StatusInternalServerError {
 			log.Errorf("authentication middleware error: %v", err)
+		}
+		if strings.HasPrefix(c.Request.URL.Path, "/v1/messages") {
+			claude.WriteAuthenticationError(c, statusCode, err.Message)
+			return
 		}
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
 	}

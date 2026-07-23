@@ -82,6 +82,10 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		}
 	}
 
+	// Preserve top-level system instructions when a compaction block replaces
+	// earlier message history.
+	systemInputCount := len(inputItems)
+
 	// Process messages and transform their contents to appropriate formats.
 	messagesResult := rootResult.Get("messages")
 	if messagesResult.IsArray() {
@@ -123,9 +127,21 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				contentItems = append(contentItems, content)
 			}
 
-			appendImageContent := func(dataURL string) {
+			appendImageContent := func(imageURL string) {
 				content := []byte(`{"type":"input_image","image_url":""}`)
-				content, _ = sjson.SetBytes(content, "image_url", dataURL)
+				content, _ = sjson.SetBytes(content, "image_url", imageURL)
+				contentItems = append(contentItems, content)
+			}
+
+			appendDocumentContent := func(field, value, filename string) {
+				content := []byte(`{"type":"input_file"}`)
+				content, _ = sjson.SetBytes(content, field, value)
+				if field == "file_data" {
+					filename = codexInlineDocumentFilename(value, filename)
+				}
+				if filename != "" {
+					content, _ = sjson.SetBytes(content, "filename", filename)
+				}
 				contentItems = append(contentItems, content)
 			}
 
@@ -163,24 +179,64 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						appendTextContent(messageContentResult.Get("text").String())
 					case "thinking":
 						appendReasoningContent(messageContentResult)
+					case "redacted_thinking", "fallback":
+						// These are model-internal history markers. They must be accepted on
+						// replay but cannot be translated into a valid GPT reasoning signature.
+					case "compaction":
+						if summary := firstNonEmptyClaudeString(messageContentResult, "summary", "content", "text"); summary != "" {
+							contentItems = contentItems[:0]
+							inputItems = inputItems[:systemInputCount]
+							appendTextContent(summary)
+						}
+					case "server_tool_use":
+						if messageContentResult.Get("name").String() == "web_search" {
+							query := strings.TrimSpace(messageContentResult.Get("input.query").String())
+							if query != "" {
+								appendTextContent("Web search requested: " + query)
+							}
+						}
+					case "web_search_tool_result":
+						if text := claudeWebSearchResultHistoryText(messageContentResult); text != "" {
+							appendTextContent(text)
+						}
+					case "search_result":
+						if text := claudeSearchResultText(messageContentResult); text != "" {
+							appendTextContent(text)
+						}
 					case "image":
 						sourceResult := messageContentResult.Get("source")
+						if sourceResult.Get("type").String() == "url" {
+							if imageURL := sourceResult.Get("url").String(); imageURL != "" {
+								appendImageContent(imageURL)
+							}
+							break
+						}
 						if sourceResult.Exists() {
-							data := sourceResult.Get("data").String()
-							if data == "" {
-								data = sourceResult.Get("base64").String()
+							if data := claudeMediaData(sourceResult); data != "" {
+								appendImageContent(fmt.Sprintf("data:%s;base64,%s", claudeMediaType(sourceResult), data))
 							}
-							if data != "" {
-								mediaType := sourceResult.Get("media_type").String()
-								if mediaType == "" {
-									mediaType = sourceResult.Get("mime_type").String()
-								}
-								if mediaType == "" {
-									mediaType = "application/octet-stream"
-								}
-								dataURL := fmt.Sprintf("data:%s;base64,%s", mediaType, data)
-								appendImageContent(dataURL)
-							}
+						}
+					case "document":
+						appendClaudeDocumentContext(messageContentResult.Get("context"), appendTextContent)
+						sourceResult := messageContentResult.Get("source")
+						switch sourceResult.Get("type").String() {
+						case "url":
+							appendDocumentContent("file_url", sourceResult.Get("url").String(), messageContentResult.Get("title").String())
+							break
+						case "text":
+							appendClaudeDocumentTitle(messageContentResult.Get("title").String(), appendTextContent)
+							appendTextContent(sourceResult.Get("data").String())
+							break
+						case "content":
+							appendClaudeDocumentTitle(messageContentResult.Get("title").String(), appendTextContent)
+							appendClaudeContentDocumentSource(sourceResult.Get("content"), appendTextContent, appendImageContent)
+							break
+						}
+						if sourceResult.Get("type").String() != "base64" {
+							break
+						}
+						if data := claudeMediaData(sourceResult); data != "" {
+							appendDocumentContent("file_data", fmt.Sprintf("data:%s;base64,%s", claudeMediaType(sourceResult), data), messageContentResult.Get("title").String())
 						}
 					case "tool_use":
 						flushMessage()
@@ -201,35 +257,78 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						flushMessage()
 						functionCallOutputMessage := []byte(`{"type":"function_call_output"}`)
 						functionCallOutputMessage, _ = sjson.SetBytes(functionCallOutputMessage, "call_id", shortenCodexCallIDIfNeeded(messageContentResult.Get("tool_use_id").String()))
+						// Responses `status` is item lifecycle, not error semantics: a failed
+						// tool call still completed, so only the injected failure text below
+						// carries Anthropic's is_error signal.
+						isError := messageContentResult.Get("is_error").Bool()
 
 						contentResult := messageContentResult.Get("content")
 						if contentResult.IsArray() {
 							contentResults := contentResult.Array()
-							toolResultContentItems := make([][]byte, 0, len(contentResults))
+							toolResultContentItems := make([][]byte, 0, len(contentResults)+1)
+							if isError {
+								toolResultContentItems = append(toolResultContentItems, []byte(`{"type":"input_text","text":"Tool execution failed."}`))
+							}
 							for k := 0; k < len(contentResults); k++ {
 								toolResultContentType := contentResults[k].Get("type").String()
 								if toolResultContentType == "image" {
 									sourceResult := contentResults[k].Get("source")
-									if sourceResult.Exists() {
-										data := sourceResult.Get("data").String()
-										if data == "" {
-											data = sourceResult.Get("base64").String()
+									if sourceResult.Get("type").String() == "url" {
+										if imageURL := sourceResult.Get("url").String(); imageURL != "" {
+											toolResultContent := []byte(`{"type":"input_image","image_url":""}`)
+											toolResultContent, _ = sjson.SetBytes(toolResultContent, "image_url", imageURL)
+											toolResultContentItems = append(toolResultContentItems, toolResultContent)
 										}
-										if data != "" {
-											mediaType := sourceResult.Get("media_type").String()
-											if mediaType == "" {
-												mediaType = sourceResult.Get("mime_type").String()
-											}
-											if mediaType == "" {
-												mediaType = "application/octet-stream"
-											}
-											dataURL := fmt.Sprintf("data:%s;base64,%s", mediaType, data)
+										continue
+									}
+									if sourceResult.Exists() {
+										if data := claudeMediaData(sourceResult); data != "" {
+											dataURL := fmt.Sprintf("data:%s;base64,%s", claudeMediaType(sourceResult), data)
 
 											toolResultContent := []byte(`{"type":"input_image","image_url":""}`)
 											toolResultContent, _ = sjson.SetBytes(toolResultContent, "image_url", dataURL)
 											toolResultContentItems = append(toolResultContentItems, toolResultContent)
 										}
 									}
+								} else if toolResultContentType == "document" {
+									toolResultContentItems = appendCodexDocumentContextParts(toolResultContentItems, contentResults[k].Get("context"))
+									sourceResult := contentResults[k].Get("source")
+									switch sourceResult.Get("type").String() {
+									case "text":
+										if title := strings.TrimSpace(contentResults[k].Get("title").String()); title != "" {
+											toolResultContentItems = appendCodexInputTextPart(toolResultContentItems, "Document title: "+title)
+										}
+										toolResultContentItems = appendCodexInputTextPart(toolResultContentItems, sourceResult.Get("data").String())
+										continue
+									case "content":
+										if title := strings.TrimSpace(contentResults[k].Get("title").String()); title != "" {
+											toolResultContentItems = appendCodexInputTextPart(toolResultContentItems, "Document title: "+title)
+										}
+										toolResultContentItems = appendCodexContentDocumentParts(toolResultContentItems, sourceResult.Get("content"))
+										continue
+									}
+									fileField := "file_url"
+									fileData := sourceResult.Get("url").String()
+									if fileData == "" {
+										fileField = "file_data"
+										if data := claudeMediaData(sourceResult); data != "" {
+											fileData = fmt.Sprintf("data:%s;base64,%s", claudeMediaType(sourceResult), data)
+										}
+									}
+									if fileData != "" {
+										toolResultContent := []byte(`{"type":"input_file"}`)
+										toolResultContent, _ = sjson.SetBytes(toolResultContent, fileField, fileData)
+										filename := strings.TrimSpace(contentResults[k].Get("title").String())
+										if fileField == "file_data" {
+											filename = codexInlineDocumentFilename(fileData, filename)
+										}
+										if filename != "" {
+											toolResultContent, _ = sjson.SetBytes(toolResultContent, "filename", filename)
+										}
+										toolResultContentItems = append(toolResultContentItems, toolResultContent)
+									}
+								} else if toolResultContentType == "search_result" {
+									toolResultContentItems = appendCodexInputTextPart(toolResultContentItems, claudeSearchResultText(contentResults[k]))
 								} else if toolResultContentType == "text" {
 									toolResultContent := []byte(`{"type":"input_text","text":""}`)
 									toolResultContent, _ = sjson.SetBytes(toolResultContent, "text", contentResults[k].Get("text").String())
@@ -239,10 +338,18 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 							if len(toolResultContentItems) > 0 {
 								functionCallOutputMessage, _ = sjson.SetRawBytes(functionCallOutputMessage, "output", translatorcommon.JoinRawArray(toolResultContentItems))
 							} else {
-								functionCallOutputMessage, _ = sjson.SetBytes(functionCallOutputMessage, "output", messageContentResult.Get("content").String())
+								resultText := messageContentResult.Get("content").String()
+								if isError {
+									resultText = "Tool execution failed: " + resultText
+								}
+								functionCallOutputMessage, _ = sjson.SetBytes(functionCallOutputMessage, "output", resultText)
 							}
 						} else {
-							functionCallOutputMessage, _ = sjson.SetBytes(functionCallOutputMessage, "output", messageContentResult.Get("content").String())
+							resultText := messageContentResult.Get("content").String()
+							if isError {
+								resultText = "Tool execution failed: " + resultText
+							}
+							functionCallOutputMessage, _ = sjson.SetBytes(functionCallOutputMessage, "output", resultText)
 						}
 
 						inputItems = append(inputItems, functionCallOutputMessage)
@@ -289,14 +396,19 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					tool, _ = sjson.SetBytes(tool, "name", name)
 				}
 			}
-			tool, _ = sjson.SetRawBytes(tool, "parameters", []byte(normalizeToolParameters(toolResult.Get("input_schema").Raw)))
-			for _, path := range []string{"input_schema", "parameters.$schema", "cache_control", "defer_loading"} {
+			parameters := normalizeToolParameters(toolResult.Get("input_schema").Raw)
+			if toolResult.Get("strict").Bool() {
+				parameters = normalizeCodexStrictSchema(parameters)
+			} else {
+				tool, _ = sjson.SetBytes(tool, "strict", false)
+			}
+			tool, _ = sjson.SetRawBytes(tool, "parameters", []byte(parameters))
+			// allowed_callers passed validation as singleton "direct", which is
+			// Codex's only invocation mode; drop the Anthropic-only field.
+			for _, path := range []string{"input_schema", "parameters.$schema", "cache_control", "defer_loading", "allowed_callers"} {
 				if gjson.GetBytes(tool, path).Exists() {
 					tool, _ = sjson.DeleteBytes(tool, path)
 				}
-			}
-			if gjson.GetBytes(tool, "strict").Type != gjson.False {
-				tool, _ = sjson.SetBytes(tool, "strict", false)
 			}
 			toolItems = append(toolItems, tool)
 		}
@@ -310,38 +422,27 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 
 	// Add additional configuration parameters for the Codex API.
 	template, _ = sjson.SetBytes(template, "parallel_tool_calls", parallelToolCalls)
-
-	// Convert thinking.budget_tokens to reasoning.effort.
-	reasoningEffort := "medium"
-	if thinkingConfig := rootResult.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
-		switch thinkingConfig.Get("type").String() {
-		case "enabled":
-			if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
-				budget := int(budgetTokens.Int())
-				if effort, ok := thinking.ConvertBudgetToLevel(budget); ok && effort != "" {
-					reasoningEffort = effort
-				}
-			}
-		case "adaptive", "auto":
-			// Adaptive thinking can carry an explicit effort in output_config.effort (Claude 4.6).
-			// Pass through directly; ApplyThinking handles clamping to target model's levels.
-			effort := ""
-			if v := rootResult.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
-				effort = strings.ToLower(strings.TrimSpace(v.String()))
-			}
-			if effort != "" {
-				reasoningEffort = effort
-			} else {
-				reasoningEffort = string(thinking.LevelXHigh)
-			}
-		case "disabled":
-			if effort, ok := thinking.ConvertBudgetToLevel(0); ok && effort != "" {
-				reasoningEffort = effort
-			}
+	if maxTokens := rootResult.Get("max_tokens"); maxTokens.Exists() {
+		template, _ = sjson.SetBytes(template, "max_output_tokens", maxTokens.Int())
+	}
+	if format := rootResult.Get("output_config.format"); format.Exists() {
+		template, _ = sjson.SetBytes(template, "text.format.type", "json_schema")
+		template, _ = sjson.SetBytes(template, "text.format.name", "anthropic_output")
+		template, _ = sjson.SetBytes(template, "text.format.strict", true)
+		if schema := format.Get("schema"); schema.Exists() {
+			template, _ = sjson.SetRawBytes(template, "text.format.schema", []byte(normalizeCodexStrictSchema(schema.Raw)))
 		}
 	}
-	template, _ = sjson.SetBytes(template, "reasoning.effort", reasoningEffort)
-	template, _ = sjson.SetBytes(template, "reasoning.summary", "auto")
+
+	if reasoningEffort, summaryVisible, reasoningConfigured := claudeCodexReasoning(rootResult); reasoningConfigured {
+		template, _ = sjson.SetBytes(template, "reasoning.effort", reasoningEffort)
+		if reasoningEffort != string(thinking.LevelNone) {
+			if summaryVisible {
+				template, _ = sjson.SetBytes(template, "reasoning.summary", "auto")
+			}
+			template, _ = sjson.SetBytes(template, "include", []string{"reasoning.encrypted_content"})
+		}
+	}
 	serviceTier := normalizeCodexServiceTier(rootResult.Get("service_tier"))
 	if speed := rootResult.Get("speed"); speed.Type == gjson.String && speed.String() == "fast" {
 		serviceTier = "priority"
@@ -351,7 +452,6 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	}
 	template, _ = sjson.SetBytes(template, "stream", true)
 	template, _ = sjson.SetBytes(template, "store", false)
-	template, _ = sjson.SetBytes(template, "include", []string{"reasoning.encrypted_content"})
 	if toolsResult.IsArray() {
 		template, _ = sjson.SetRawBytes(template, "tools", translatorcommon.JoinRawArray(toolItems))
 	}
@@ -360,9 +460,314 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	return template
 }
 
+func firstNonEmptyClaudeString(result gjson.Result, paths ...string) string {
+	for _, path := range paths {
+		if value := strings.TrimSpace(result.Get(path).String()); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func claudeMediaType(source gjson.Result) string {
+	if mediaType := strings.TrimSpace(source.Get("media_type").String()); mediaType != "" {
+		return mediaType
+	}
+	if mediaType := strings.TrimSpace(source.Get("mime_type").String()); mediaType != "" {
+		return mediaType
+	}
+	return "application/octet-stream"
+}
+
+func claudeMediaData(source gjson.Result) string {
+	if data := strings.TrimSpace(source.Get("data").String()); data != "" {
+		return data
+	}
+	return strings.TrimSpace(source.Get("base64").String())
+}
+
+func codexInlineFilename(dataURL string) string {
+	return "document" + codexInlineFileExtension(dataURL)
+}
+
+// codexInlineDocumentFilename keeps the Claude document title visible while
+// guaranteeing a media-type extension: Codex classifies file inputs by
+// filename extension, so a bare display title like "Quarterly report" would
+// reject or misclassify an otherwise valid inline PDF.
+func codexInlineDocumentFilename(dataURL, title string) string {
+	extension := codexInlineFileExtension(dataURL)
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return "document" + extension
+	}
+	if strings.HasSuffix(strings.ToLower(title), extension) {
+		return title
+	}
+	return title + extension
+}
+
+func codexInlineFileExtension(dataURL string) string {
+	mediaType := "application/octet-stream"
+	if strings.HasPrefix(dataURL, "data:") {
+		if separator := strings.Index(dataURL, ";"); separator > len("data:") {
+			// MIME types are case-insensitive (RFC 2045); the request validator
+			// accepts mixed case, so the extension lookup must too.
+			mediaType = strings.ToLower(strings.TrimSpace(dataURL[len("data:"):separator]))
+		}
+	}
+	extension := map[string]string{
+		"application/pdf": ".pdf",
+		"text/plain":      ".txt",
+		"image/png":       ".png",
+		"image/jpeg":      ".jpg",
+		"image/gif":       ".gif",
+		"image/webp":      ".webp",
+	}[mediaType]
+	if extension == "" {
+		extension = ".bin"
+	}
+	return extension
+}
+
+func appendClaudeDocumentTitle(title string, appendText func(string)) {
+	title = strings.TrimSpace(title)
+	if title != "" && appendText != nil {
+		appendText("Document title: " + title)
+	}
+}
+
+func appendClaudeDocumentContext(contextResult gjson.Result, appendText func(string)) {
+	if appendText == nil || !contextResult.Exists() {
+		return
+	}
+	if contextResult.Type == gjson.String {
+		appendText(contextResult.String())
+		return
+	}
+	if contextResult.IsArray() {
+		contextResult.ForEach(func(_, block gjson.Result) bool {
+			if block.Get("type").String() == "text" {
+				appendText(block.Get("text").String())
+			}
+			return true
+		})
+	}
+}
+
+func appendClaudeContentDocumentSource(content gjson.Result, appendText, appendImage func(string)) {
+	if content.Type == gjson.String {
+		appendText(content.String())
+		return
+	}
+	if !content.IsArray() {
+		return
+	}
+	content.ForEach(func(_, block gjson.Result) bool {
+		switch block.Get("type").String() {
+		case "text":
+			appendText(block.Get("text").String())
+		case "image":
+			source := block.Get("source")
+			if source.Get("type").String() == "url" {
+				appendImage(source.Get("url").String())
+				return true
+			}
+			if data := claudeMediaData(source); data != "" {
+				appendImage(fmt.Sprintf("data:%s;base64,%s", claudeMediaType(source), data))
+			}
+		}
+		return true
+	})
+}
+
+func appendCodexInputTextPart(parts [][]byte, text string) [][]byte {
+	if text == "" {
+		return parts
+	}
+	part := []byte(`{"type":"input_text","text":""}`)
+	part, _ = sjson.SetBytes(part, "text", text)
+	return append(parts, part)
+}
+
+func appendCodexDocumentContextParts(parts [][]byte, contextResult gjson.Result) [][]byte {
+	if contextResult.Type == gjson.String {
+		return appendCodexInputTextPart(parts, contextResult.String())
+	}
+	if contextResult.IsArray() {
+		contextResult.ForEach(func(_, block gjson.Result) bool {
+			if block.Get("type").String() == "text" {
+				parts = appendCodexInputTextPart(parts, block.Get("text").String())
+			}
+			return true
+		})
+	}
+	return parts
+}
+
+func appendCodexContentDocumentParts(parts [][]byte, content gjson.Result) [][]byte {
+	if content.Type == gjson.String {
+		return appendCodexInputTextPart(parts, content.String())
+	}
+	if !content.IsArray() {
+		return parts
+	}
+	content.ForEach(func(_, block gjson.Result) bool {
+		switch block.Get("type").String() {
+		case "text":
+			parts = appendCodexInputTextPart(parts, block.Get("text").String())
+		case "image":
+			source := block.Get("source")
+			imageURL := source.Get("url").String()
+			if imageURL == "" {
+				if data := claudeMediaData(source); data != "" {
+					imageURL = fmt.Sprintf("data:%s;base64,%s", claudeMediaType(source), data)
+				}
+			}
+			if imageURL != "" {
+				part := []byte(`{"type":"input_image","image_url":""}`)
+				part, _ = sjson.SetBytes(part, "image_url", imageURL)
+				parts = append(parts, part)
+			}
+		}
+		return true
+	})
+	return parts
+}
+
+func claudeSearchResultText(block gjson.Result) string {
+	var builder strings.Builder
+	if title := strings.TrimSpace(block.Get("title").String()); title != "" {
+		builder.WriteString("Search result: ")
+		builder.WriteString(title)
+		builder.WriteByte('\n')
+	}
+	if source := strings.TrimSpace(block.Get("source").String()); source != "" {
+		builder.WriteString("Source: ")
+		builder.WriteString(source)
+		builder.WriteByte('\n')
+	}
+	content := block.Get("content")
+	if content.IsArray() {
+		content.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").String() == "text" {
+				if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+					builder.WriteString(text)
+					builder.WriteByte('\n')
+				}
+			}
+			return true
+		})
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+func claudeWebSearchResultHistoryText(block gjson.Result) string {
+	var builder strings.Builder
+	if toolUseID := strings.TrimSpace(block.Get("tool_use_id").String()); toolUseID != "" {
+		builder.WriteString("Web search results for ")
+		builder.WriteString(toolUseID)
+		builder.WriteString(":\n")
+	}
+	content := block.Get("content")
+	if content.IsObject() {
+		errorCode := firstNonEmptyClaudeString(content, "error_code", "type")
+		if errorCode != "" {
+			builder.WriteString("Web search failed: ")
+			builder.WriteString(errorCode)
+			builder.WriteByte('\n')
+		}
+	}
+	if content.IsArray() {
+		content.ForEach(func(_, result gjson.Result) bool {
+			if result.Get("type").String() != "web_search_result" {
+				return true
+			}
+			title := strings.TrimSpace(result.Get("title").String())
+			url := strings.TrimSpace(result.Get("url").String())
+			if title == "" {
+				title = url
+			}
+			if title == "" {
+				return true
+			}
+			builder.WriteString("- ")
+			builder.WriteString(title)
+			if url != "" && url != title {
+				builder.WriteString(" (")
+				builder.WriteString(url)
+				builder.WriteString(")")
+			}
+			builder.WriteByte('\n')
+			return true
+		})
+	}
+	return strings.TrimSpace(builder.String())
+}
+
 func codexClaudeTargetAcceptsGrokSignature(modelName string) bool {
 	baseModel := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(modelName).ModelName))
 	return strings.Contains(baseModel, "grok")
+}
+
+func claudeCodexReasoning(root gjson.Result) (effort string, summaryVisible bool, enabled bool) {
+	thinkingConfig := root.Get("thinking")
+	thinkingType := strings.ToLower(strings.TrimSpace(thinkingConfig.Get("type").String()))
+	requestedModel := util.CanonicalClaudeModelID(root.Get("model").String())
+	// Effort is documented to work without extended thinking; an explicit
+	// output_config.effort must survive the no-thinking default branches below.
+	explicitEffort := strings.ToLower(strings.TrimSpace(root.Get("output_config.effort").String()))
+
+	if thinkingConfig.Exists() {
+		switch thinkingType {
+		case "disabled":
+			return string(thinking.LevelNone), false, true
+		case "enabled", "adaptive", "auto":
+			enabled = true
+		default:
+			return "", false, false
+		}
+	} else {
+		switch {
+		case requestedModel == "claude-fable-5",
+			requestedModel == "claude-mythos-5",
+			requestedModel == "claude-mythos-preview",
+			requestedModel == "claude-sonnet-5":
+			enabled = true
+		case requestedModel == "claude-opus-4-8",
+			requestedModel == "claude-opus-4-7",
+			requestedModel == "claude-opus-4-6",
+			requestedModel == "claude-sonnet-4-6":
+			if explicitEffort != "" {
+				return explicitEffort, false, true
+			}
+			return string(thinking.LevelNone), false, true
+		default:
+			// Preserve the previous Codex default for custom and older aliases whose
+			// Claude thinking capabilities are not known at this boundary.
+			if explicitEffort != "" {
+				return explicitEffort, true, true
+			}
+			return string(thinking.LevelMedium), true, true
+		}
+	}
+
+	effort = explicitEffort
+	if thinkingType == "enabled" {
+		if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
+			if mapped, ok := thinking.ConvertBudgetToLevel(int(budgetTokens.Int())); ok && mapped != "" {
+				effort = mapped
+			}
+		}
+	}
+	if effort == "" {
+		effort = string(thinking.LevelHigh)
+	}
+	display := strings.ToLower(strings.TrimSpace(thinkingConfig.Get("display").String()))
+	summaryVisible = display == "summarized" || (thinkingType == "enabled" && display != "omitted" && !util.ClaudeThinkingDisplayOmittedByDefault(requestedModel))
+	if display == "" && (thinkingType == "adaptive" || thinkingType == "auto") {
+		summaryVisible = requestedModel == "claude-opus-4-6" || requestedModel == "claude-sonnet-4-6"
+	}
+	return effort, summaryVisible, true
 }
 
 func normalizeCodexServiceTier(result gjson.Result) string {
@@ -396,7 +801,7 @@ func shortenCodexCallIDIfNeeded(id string) string {
 }
 
 func isClaudeWebSearchToolType(toolType string) bool {
-	return toolType == "web_search_20250305" || toolType == "web_search_20260209"
+	return toolType == "web_search_20250305" || toolType == "web_search_20260209" || toolType == "web_search_20260318"
 }
 
 func buildClaudeWebSearchToolNameSet(tools gjson.Result) map[string]struct{} {
@@ -562,6 +967,14 @@ func buildReverseMapFromClaudeOriginalToShort(original []byte) map[string]string
 		m = buildShortNameMap(names)
 	}
 	return m
+}
+
+func normalizeCodexStrictSchema(raw string) string {
+	normalized, err := translatorcommon.NormalizeCodexStrictSchema(raw)
+	if err != nil {
+		return raw
+	}
+	return normalized
 }
 
 // normalizeToolParameters ensures object schemas contain at least an empty properties map.

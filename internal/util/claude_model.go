@@ -9,6 +9,20 @@ func IsClaudeThinkingModel(model string) bool {
 	return strings.Contains(lower, "claude") && strings.Contains(lower, "thinking")
 }
 
+// ClaudeThinkingDisplayOmittedByDefault reports models whose thinking
+// `display` defaults to "omitted" per the Anthropic thinking contract
+// (docs/en/build-with-claude/thinking, verified 2026-07-23). Manual and
+// adaptive thinking on these models must not request summaries unless the
+// caller explicitly sets display: "summarized".
+func ClaudeThinkingDisplayOmittedByDefault(model string) bool {
+	switch model {
+	case "claude-fable-5", "claude-mythos-5", "claude-mythos-preview",
+		"claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7":
+		return true
+	}
+	return false
+}
+
 const claudeDDModelPrefix = "claude-fable-5-dd-"
 
 // EnsureClaudeModelIDPrefix rewrites model IDs for Anthropic /models listings.
@@ -44,6 +58,15 @@ func ResolveClaudeModelIDPrefix(id string) string {
 		return resolved + "(" + suffix + ")"
 	}
 	return resolved
+}
+
+// CanonicalClaudeModelID removes CLIProxyAPI's documented routing and thinking
+// suffixes without treating prefix-sharing custom aliases as built-in models.
+func CanonicalClaudeModelID(id string) string {
+	resolved := ResolveClaudeModelIDPrefix(strings.TrimSpace(id))
+	base, _, _ := splitModelThinkingSuffix(resolved)
+	base = strings.ToLower(strings.TrimSpace(base))
+	return strings.TrimSuffix(base, "[1m]")
 }
 
 func splitModelThinkingSuffix(model string) (base, suffix string, hasSuffix bool) {

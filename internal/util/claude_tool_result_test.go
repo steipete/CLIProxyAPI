@@ -95,6 +95,14 @@ func TestConvertClaudeToolResultContent(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeToolResultPreservesError(t *testing.T) {
+	block := gjson.Parse(`{"type":"tool_result","is_error":true,"content":"failed"}`)
+	got := ConvertClaudeToolResult(block)
+	if !got.IsError || got.Result != "failed" {
+		t.Fatalf("result = %#v", got)
+	}
+}
+
 func TestConvertClaudeToolResultContent_ImageFields(t *testing.T) {
 	content := gjson.Get(`{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]}`, "content")
 	got := ConvertClaudeToolResultContent(content)

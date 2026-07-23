@@ -655,6 +655,307 @@ func TestConvertClaudeRequestToCodex_IgnoresNonCodexThinkingSignatures(t *testin
 	}
 }
 
+func TestConvertClaudeRequestToCodex_PreservesStrictAndStructuredOutput(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"max_tokens":123,
+		"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"answer":{"type":"string"},"note":{"type":"string"}},"required":["answer","note"],"additionalProperties":false}}},
+		"tools":[{"name":"answer_tool","strict":true,"input_schema":{"type":"object","properties":{"required_value":{"type":"string"},"optional_value":{"type":"string"}},"required":["required_value","optional_value"],"additionalProperties":false}}],
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	if !result.Get("tools.0.strict").Bool() {
+		t.Fatalf("strict tool setting lost: %s", result.Raw)
+	}
+	if result.Get("max_output_tokens").Int() != 123 {
+		t.Fatalf("max_output_tokens = %s", result.Get("max_output_tokens").Raw)
+	}
+	if result.Get("text.format.type").String() != "json_schema" || !result.Get("text.format.strict").Bool() {
+		t.Fatalf("structured output missing: %s", result.Raw)
+	}
+	if !result.Get("text.format.schema.properties.answer").Exists() {
+		t.Fatalf("structured output schema missing: %s", result.Raw)
+	}
+	if result.Get("text.format.schema.required.#").Int() != 2 || result.Get("text.format.schema.additionalProperties").Type != gjson.False {
+		t.Fatalf("strict output schema not normalized: %s", result.Raw)
+	}
+	if result.Get("tools.0.parameters.required.#").Int() != 2 || result.Get("tools.0.parameters.additionalProperties").Type != gjson.False {
+		t.Fatalf("strict tool schema not normalized: %s", result.Raw)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_OrdinaryToolsAreNonStrict(t *testing.T) {
+	for _, toolType := range []string{"", `"type":"custom",`} {
+		input := []byte(`{"model":"claude-opus-4-8","tools":[{` + toolType + `"name":"lookup","input_schema":{"type":"object","properties":{"value":{"type":"string"}}}}],"messages":[{"role":"user","content":"hello"}]}`)
+		result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+		if result.Get("tools.0.type").String() != "function" {
+			t.Fatalf("ordinary tool type = %s, want function: %s", result.Get("tools.0.type").Raw, result.Raw)
+		}
+		if result.Get("tools.0.strict").Type != gjson.False {
+			t.Fatalf("ordinary tool strict = %s, want false: %s", result.Get("tools.0.strict").Raw, result.Raw)
+		}
+	}
+}
+
+func TestConvertClaudeRequestToCodex_ThinkingDefaultsFollowClaudeModel(t *testing.T) {
+	tests := []struct {
+		model         string
+		wantEffort    string
+		wantEncrypted bool
+	}{
+		{model: "claude-fable-5", wantEffort: "high", wantEncrypted: true},
+		{model: "claude-fable-5[1m]", wantEffort: "high", wantEncrypted: true},
+		{model: "claude-fable-5-internal", wantEffort: "medium", wantEncrypted: true},
+		{model: "claude-mythos-preview", wantEffort: "high", wantEncrypted: true},
+		{model: "claude-sonnet-5", wantEffort: "high", wantEncrypted: true},
+		{model: "claude-opus-4-8", wantEffort: "none"},
+		{model: "claude-sonnet-4-6", wantEffort: "none"},
+		{model: "user-defined-model", wantEffort: "medium", wantEncrypted: true},
+	}
+	for _, test := range tests {
+		t.Run(test.model, func(t *testing.T) {
+			input := []byte(`{"model":"` + test.model + `","messages":[{"role":"user","content":"hello"}]}`)
+			result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+			if got := result.Get("reasoning.effort").String(); got != test.wantEffort {
+				t.Fatalf("reasoning effort = %q, want %q: %s", got, test.wantEffort, result.Raw)
+			}
+			if got := result.Get("include.0").Exists(); got != test.wantEncrypted {
+				t.Fatalf("encrypted content include = %v, want %v: %s", got, test.wantEncrypted, result.Raw)
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToCodex_Adaptive46DefaultsToSummarizedThinking(t *testing.T) {
+	for _, model := range []string{"claude-opus-4-6", "claude-sonnet-4-6"} {
+		t.Run(model, func(t *testing.T) {
+			input := []byte(`{"model":"` + model + `","thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"hello"}]}`)
+			result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+			if result.Get("reasoning.summary").String() != "auto" {
+				t.Fatalf("reasoning summary missing: %s", result.Raw)
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToCodex_ThinkingDisplayOverridesDefaults(t *testing.T) {
+	tests := []struct {
+		name        string
+		thinking    string
+		wantSummary bool
+	}{
+		{name: "manual default summarized", thinking: `{"type":"enabled","budget_tokens":2048}`, wantSummary: true},
+		{name: "manual explicitly omitted", thinking: `{"type":"enabled","budget_tokens":2048,"display":"omitted"}`},
+		{name: "adaptive explicitly summarized", thinking: `{"type":"adaptive","display":"summarized"}`, wantSummary: true},
+		{name: "adaptive explicitly omitted", thinking: `{"type":"adaptive","display":"omitted"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := []byte(`{"model":"claude-opus-4-6","thinking":` + test.thinking + `,"messages":[{"role":"user","content":"hello"}]}`)
+			result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+			if got := result.Get("reasoning.summary").String() == "auto"; got != test.wantSummary {
+				t.Fatalf("reasoning summary = %v, want %v: %s", got, test.wantSummary, result.Raw)
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToCodex_PreservesToolResultError(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-fable-5",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"check","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","is_error":true,"content":"opaque failure"}]}
+		]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	output := result.Get("input.#(type==\"function_call_output\")")
+	if output.Get("status").Exists() {
+		t.Fatalf("failed tool call must stay a completed item without lifecycle status: %s", result.Raw)
+	}
+	if !strings.Contains(output.Get("output").String(), "Tool execution failed") {
+		t.Fatalf("tool error marker missing: %s", result.Raw)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_MapsURLImageAndDocument(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"messages":[{"role":"user","content":[
+			{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}},
+			{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AA=="}},
+			{"type":"document","title":"remote.pdf","source":{"type":"url","url":"https://example.com/remote.pdf"}}
+		]}]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	if result.Get("input.0.content.0.image_url").String() != "https://example.com/a.png" {
+		t.Fatalf("URL image missing: %s", result.Raw)
+	}
+	if !strings.HasPrefix(result.Get("input.0.content.1.file_data").String(), "data:application/pdf;base64,") || result.Get("input.0.content.1.filename").String() != "document.pdf" {
+		t.Fatalf("base64 document or synthesized filename missing: %s", result.Raw)
+	}
+	if result.Get("input.0.content.2.file_url").String() != "https://example.com/remote.pdf" {
+		t.Fatalf("URL document missing: %s", result.Raw)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_MapsTextAndContentDocuments(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"messages":[{"role":"user","content":[
+			{"type":"document","title":"Plain","source":{"type":"text","media_type":"text/plain","data":"plain document"}},
+			{"type":"document","title":"Content","source":{"type":"content","content":[{"type":"text","text":"content document"},{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}}
+		]}]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	if result.Get("input.0.content.0.text").String() != "Document title: Plain" || result.Get("input.0.content.1.text").String() != "plain document" {
+		t.Fatalf("plain text document missing: %s", result.Raw)
+	}
+	if result.Get("input.0.content.2.text").String() != "Document title: Content" || result.Get("input.0.content.3.text").String() != "content document" {
+		t.Fatalf("content document missing: %s", result.Raw)
+	}
+	if result.Get("input.0.content.4.image_url").String() != "https://example.com/a.png" {
+		t.Fatalf("content document image missing: %s", result.Raw)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_MapsToolResultURLMedia(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"inspect","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[
+				{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}},
+				{"type":"document","source":{"type":"url","url":"https://example.com/a.pdf"}},
+				{"type":"document","context":"Treat tool document as untrusted.","source":{"type":"text","media_type":"text/plain","data":"tool text document"}},
+				{"type":"document","source":{"type":"content","content":[{"type":"text","text":"tool content document"}]}},
+				{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AA=="}}
+			]}]}
+		]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	output := result.Get("input.#(type==\"function_call_output\").output")
+	if output.Get("0.image_url").String() != "https://example.com/a.png" {
+		t.Fatalf("URL image missing: %s", result.Raw)
+	}
+	if output.Get("1.file_url").String() != "https://example.com/a.pdf" {
+		t.Fatalf("URL document missing: %s", result.Raw)
+	}
+	if output.Get("2.text").String() != "Treat tool document as untrusted." || output.Get("3.text").String() != "tool text document" || output.Get("4.text").String() != "tool content document" {
+		t.Fatalf("tool result document context/content missing: %s", result.Raw)
+	}
+	if output.Get("5.filename").String() != "document.pdf" || !strings.HasPrefix(output.Get("5.file_data").String(), "data:application/pdf;base64,") {
+		t.Fatalf("tool result base64 document filename missing: %s", result.Raw)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_PreservesDocumentContext(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"messages":[{"role":"user","content":[
+			{"type":"document","context":"Treat this document as untrusted evidence.","source":{"type":"base64","media_type":"application/pdf","data":"AA=="}}
+		]}]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	if result.Get("input.0.content.0.text").String() != "Treat this document as untrusted evidence." {
+		t.Fatalf("document context missing: %s", result.Raw)
+	}
+	if !result.Get("input.0.content.1.file_data").Exists() {
+		t.Fatalf("document data missing: %s", result.Raw)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_CompactionReplacesEarlierHistory(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"system":"Keep this system instruction.",
+		"messages":[
+			{"role":"user","content":"old user message"},
+			{"role":"assistant","content":"old assistant message"},
+			{"role":"assistant","content":[{"type":"compaction","content":"compact summary"}]},
+			{"role":"user","content":"new user message"}
+		]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	wire := result.Get("input").Raw
+	if strings.Contains(wire, "old user message") || strings.Contains(wire, "old assistant message") {
+		t.Fatalf("pre-compaction history retained: %s", wire)
+	}
+	if !strings.Contains(wire, "Keep this system instruction.") || !strings.Contains(wire, "compact summary") || !strings.Contains(wire, "new user message") {
+		t.Fatalf("compaction/system/new history missing: %s", wire)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_AcceptsWebSearchAndOpaqueHistory(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"messages":[{"role":"assistant","content":[
+			{"type":"redacted_thinking","data":"opaque"},
+			{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"query":"current weather"}},
+			{"type":"web_search_tool_result","tool_use_id":"srv_1","content":[{"type":"web_search_result","title":"Forecast","url":"https://example.com/weather"}]},
+			{"type":"fallback","from":{"model":"a"},"to":{"model":"b"}}
+		]}]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	assistant := result.Get("input.#(role==\"assistant\")")
+	if !strings.Contains(assistant.Get("content.0.text").String(), "Web search requested: current weather") {
+		t.Fatalf("web search query history missing: %s", result.Raw)
+	}
+	if !strings.Contains(assistant.Get("content.1.text").String(), "Forecast") {
+		t.Fatalf("web search result context missing: %s", result.Raw)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_PreservesWebSearchErrorHistory(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"messages":[{"role":"assistant","content":[
+			{"type":"web_search_tool_result","tool_use_id":"srv_1","content":{"type":"web_search_tool_result_error","error_code":"unavailable"}}
+		]}]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	if !strings.Contains(result.Get("input.0.content.0.text").String(), "Web search failed: unavailable") {
+		t.Fatalf("web search error missing: %s", result.Raw)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_PreservesMediaAliases(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"messages":[{"role":"user","content":[
+			{"type":"image","source":{"type":"base64","mime_type":"image/png","base64":"AA=="}},
+			{"type":"document","source":{"type":"content","content":[{"type":"image","source":{"type":"base64","mime_type":"image/webp","base64":"AQ=="}}]}}
+		]}]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	if got := result.Get("input.0.content.0.image_url").String(); got != "data:image/png;base64,AA==" {
+		t.Fatalf("top-level image alias changed: %q", got)
+	}
+	if got := result.Get("input.0.content.1.image_url").String(); got != "data:image/webp;base64,AQ==" {
+		t.Fatalf("nested document image alias changed: %q", got)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_MapsSearchResultsAsAttributedText(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"messages":[
+			{"role":"user","content":[{"type":"search_result","source":"https://example.com/a","title":"Direct result","content":[{"type":"text","text":"direct evidence"}]}]},
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"search","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","source":"kb://item-1","title":"Tool result","content":[{"type":"text","text":"tool evidence"}]}]}]}
+		]
+	}`)
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+	direct := result.Get("input.0.content.0.text").String()
+	if !strings.Contains(direct, "Direct result") || !strings.Contains(direct, "https://example.com/a") || !strings.Contains(direct, "direct evidence") {
+		t.Fatalf("direct search result attribution missing: %s", result.Raw)
+	}
+	toolOutput := result.Get("input.#(type==\"function_call_output\").output.0.text").String()
+	if !strings.Contains(toolOutput, "Tool result") || !strings.Contains(toolOutput, "kb://item-1") || !strings.Contains(toolOutput, "tool evidence") {
+		t.Fatalf("tool search result attribution missing: %s", result.Raw)
+	}
+}
+
 func countRequestInputItemsByType(result []byte, itemType string) int {
 	count := 0
 	gjson.GetBytes(result, "input").ForEach(func(_, item gjson.Result) bool {
@@ -671,4 +972,59 @@ func validCodexReasoningSignature() string {
 	raw[0] = 0x80
 	raw[8] = 1
 	return base64.URLEncoding.EncodeToString(raw)
+}
+
+func TestCodexInlineDocumentFilenameEnsuresMediaTypeExtension(t *testing.T) {
+	pdf := "data:application/pdf;base64,AAAA"
+	if got := codexInlineDocumentFilename(pdf, "Quarterly report"); got != "Quarterly report.pdf" {
+		t.Fatalf("titled pdf = %q, want extension appended", got)
+	}
+	if got := codexInlineDocumentFilename(pdf, "report.pdf"); got != "report.pdf" {
+		t.Fatalf("already-suffixed = %q, want unchanged", got)
+	}
+	if got := codexInlineDocumentFilename(pdf, "  "); got != "document.pdf" {
+		t.Fatalf("empty title = %q, want synthetic name", got)
+	}
+	if got := codexInlineDocumentFilename("data:text/plain;base64,AAAA", "Notes"); got != "Notes.txt" {
+		t.Fatalf("text title = %q, want .txt appended", got)
+	}
+}
+
+func TestCodexInlineFileExtensionIsCaseInsensitive(t *testing.T) {
+	if got := codexInlineDocumentFilename("data:Application/PDF;base64,AAAA", "Report"); got != "Report.pdf" {
+		t.Fatalf("mixed-case media type = %q, want .pdf", got)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_ManualThinkingDisplayDefaultsOmittedOnNewestModels(t *testing.T) {
+	build := func(model string) []byte {
+		return []byte(`{"model":"` + model + `","thinking":{"type":"enabled","budget_tokens":8000},"messages":[{"role":"user","content":"hi"}]}`)
+	}
+	for _, model := range []string{"claude-fable-5", "claude-mythos-preview", "claude-opus-4-8"} {
+		result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", build(model), false))
+		if got := result.Get("reasoning.summary").String(); got == "auto" {
+			t.Fatalf("%s: implicit display must stay omitted, got summary=%q", model, got)
+		}
+	}
+	// Older models keep the summarized manual-thinking default.
+	result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", build("claude-opus-4-6"), false))
+	if got := result.Get("reasoning.summary").String(); got != "auto" {
+		t.Fatalf("claude-opus-4-6: want summarized default, got %q", got)
+	}
+	// Explicit summarized still wins on newest models.
+	explicit := []byte(`{"model":"claude-fable-5","thinking":{"type":"enabled","display":"summarized"},"messages":[{"role":"user","content":"hi"}]}`)
+	result = gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", explicit, false))
+	if got := result.Get("reasoning.summary").String(); got != "auto" {
+		t.Fatalf("explicit summarized ignored, got %q", got)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_ExplicitEffortSurvivesWithoutThinking(t *testing.T) {
+	for _, model := range []string{"claude-opus-4-8", "claude-custom-alias"} {
+		input := []byte(`{"model":"` + model + `","output_config":{"effort":"max"},"messages":[{"role":"user","content":"hi"}]}`)
+		result := gjson.ParseBytes(ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false))
+		if got := result.Get("reasoning.effort").String(); got != "max" {
+			t.Fatalf("%s: explicit effort dropped, reasoning.effort = %q", model, got)
+		}
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,6 +69,7 @@ func (h *ClaudeCodeAPIHandler) Models() []map[string]any {
 // Parameters:
 //   - c: The Gin context for the request.
 func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
+	ensureClaudeRequestID(c)
 	// Extract raw JSON data from the incoming request
 	rawJSON, err := c.GetRawData()
 	// If data retrieval fails, return a 400 Bad Request error.
@@ -78,6 +80,10 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 				Type:    "invalid_request_error",
 			},
 		})
+		return
+	}
+	if errValidate := validateClaudeMessagesRequest(rawJSON); errValidate != nil {
+		h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errValidate})
 		return
 	}
 
@@ -100,6 +106,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context for the request.
 func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
+	ensureClaudeRequestID(c)
 	// Extract raw JSON data from the incoming request
 	rawJSON, err := c.GetRawData()
 	// If data retrieval fails, return a 400 Bad Request error.
@@ -110,6 +117,10 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 				Type:    "invalid_request_error",
 			},
 		})
+		return
+	}
+	if errValidate := validateClaudeCountTokensRequest(rawJSON); errValidate != nil {
+		h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errValidate})
 		return
 	}
 
@@ -255,8 +266,6 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 //   - c: The Gin context for the request.
 //   - rawJSON: The raw JSON request body.
 func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byte) {
-	// Get the http.Flusher interface to manually flush the response.
-	// This is crucial for streaming as it allows immediate sending of data chunks
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
@@ -269,12 +278,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	}
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
-
-	// Create a cancellable context for the backend client request
-	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
@@ -282,75 +286,48 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
-	// Peek at the first chunk to determine success or failure before setting headers
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			cliCancel(c.Request.Context().Err())
-			return
-		case errMsg, ok := <-errChan:
-			if !ok {
-				// Err channel closed cleanly; wait for data channel.
-				errChan = nil
-				continue
+	h.BootstrapStream(c, flusher, handlers.StreamBootstrapOptions{
+		Execute: func() (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+			return h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+		},
+		SetSSEHeaders: setSSEHeaders,
+		WriteCommittedError: func(errMsg *interfaces.ErrorMessage) []byte {
+			if errMsg == nil {
+				return nil
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
+			response := h.toClaudeError(errMsg)
+			// SSE headers already carry the request ID created at ingress. Keep the
+			// error event correlated to that immutable wire ID after commitment.
+			response.RequestID = ensureClaudeRequestID(c)
+			errorBytes, _ := json.Marshal(response)
+			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+			return errorBytes
+		},
+		WriteUncommittedError: func(errMsg *interfaces.ErrorMessage) {
 			h.WriteErrorResponse(c, errMsg)
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
-			}
-			return
-		case chunk, ok := <-dataChan:
-			if !ok {
-				if errMsg, okPendingErr := pendingClaudeStreamError(errChan); okPendingErr {
-					h.WriteErrorResponse(c, errMsg)
-					if errMsg != nil {
-						cliCancel(errMsg.Error)
-					} else {
-						cliCancel(nil)
-					}
-					return
-				}
-				// Stream closed without data? Send DONE or just headers.
+		},
+		OnFirstChunk: func(headersCommitted bool, upstreamHeaders http.Header, chunk []byte) {
+			if !headersCommitted {
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				flusher.Flush()
-				cliCancel(nil)
-				return
 			}
-
-			// Success! Set headers now.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-
-			// Write the first chunk
 			if len(chunk) > 0 {
 				_, _ = c.Writer.Write(chunk)
 				flusher.Flush()
 			}
-
-			// Continue streaming the rest
-			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
-			return
-		}
-	}
-}
-
-func pendingClaudeStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces.ErrorMessage, bool) {
-	if errs == nil {
-		return nil, false
-	}
-	select {
-	case errMsg, ok := <-errs:
-		if !ok {
-			return nil, false
-		}
-		return errMsg, true
-	default:
-		return nil, false
-	}
+		},
+		OnStreamClosed: func(headersCommitted bool, upstreamHeaders http.Header) {
+			if !headersCommitted {
+				setSSEHeaders()
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			}
+		},
+		Forward: func(data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, data, errs)
+		},
+		Cancel:            func(err error) { cliCancel(err) },
+		DrainPendingError: true,
+	})
 }
 
 func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
@@ -365,13 +342,14 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			if errMsg == nil {
 				return
 			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
+			status := claudeStatusCode(errMsg)
 			c.Status(status)
 
-			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+			response := h.toClaudeError(errMsg)
+			// SSE headers already carry the request ID created at ingress. Keep the
+			// error event correlated to that immutable wire ID after commitment.
+			response.RequestID = ensureClaudeRequestID(c)
+			errorBytes, _ := json.Marshal(response)
 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 		},
 	})
@@ -383,16 +361,31 @@ type claudeErrorDetail struct {
 }
 
 type claudeErrorResponse struct {
-	Type  string            `json:"type"`
-	Error claudeErrorDetail `json:"error"`
+	Type      string            `json:"type"`
+	Error     claudeErrorDetail `json:"error"`
+	RequestID string            `json:"request_id,omitempty"`
+}
+
+func claudeStatusCode(msg *interfaces.ErrorMessage) int {
+	status := http.StatusInternalServerError
+	if msg == nil {
+		return status
+	}
+	var unknownModel *handlers.UnknownModelError
+	if errors.As(msg.Error, &unknownModel) {
+		return http.StatusNotFound
+	}
+	if msg.StatusCode > 0 {
+		return msg.StatusCode
+	}
+	return status
 }
 
 func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claudeErrorResponse {
-	status := http.StatusInternalServerError
+	status := claudeStatusCode(msg)
 	errText := http.StatusText(status)
 	if msg != nil {
-		if msg.StatusCode > 0 {
-			status = msg.StatusCode
+		if msg.StatusCode > 0 && status == msg.StatusCode {
 			errText = http.StatusText(status)
 		}
 		if msg.Error != nil {
@@ -403,7 +396,8 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 	}
 	errType, message := claudeErrorDetailFromText(status, errText)
 	return claudeErrorResponse{
-		Type: "error",
+		Type:      "error",
+		RequestID: claudeRequestIDFromText(errText),
 		Error: claudeErrorDetail{
 			Type:    errType,
 			Message: message,
@@ -412,10 +406,7 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 }
 
 func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
-	status := http.StatusInternalServerError
-	if msg != nil && msg.StatusCode > 0 {
-		status = msg.StatusCode
-	}
+	status := claudeStatusCode(msg)
 	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
 			if len(values) == 0 || handlers.IsCPAReservedResponseHeader(key) {
@@ -428,7 +419,13 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 		}
 	}
 
-	body, err := json.Marshal(h.toClaudeError(msg))
+	response := h.toClaudeError(msg)
+	if response.RequestID == "" {
+		response.RequestID = ensureClaudeRequestID(c)
+	} else {
+		setClaudeRequestID(c, response.RequestID)
+	}
+	body, err := json.Marshal(response)
 	if err != nil {
 		body = []byte(`{"type":"error","error":{"type":"api_error","message":"Internal Server Error"}}`)
 	}
@@ -438,6 +435,19 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	}
 	c.Status(status)
 	_, _ = c.Writer.Write(body)
+}
+
+func claudeRequestIDFromText(errText string) string {
+	message := strings.TrimSpace(errText)
+	if !json.Valid([]byte(message)) {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(message), &payload); err != nil {
+		return ""
+	}
+	requestID, _ := payload["request_id"].(string)
+	return strings.TrimSpace(requestID)
 }
 
 func claudeErrorDetailFromText(status int, errText string) (string, string) {

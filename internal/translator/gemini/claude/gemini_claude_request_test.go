@@ -225,6 +225,24 @@ func TestConvertClaudeRequestToGemini_StructuredToolResult(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToGemini_ErrorToolResultPreservesRawResult(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gemini-3-flash-preview",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"json-call-1","name":"json","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"json-call-1","is_error":true,"content":{"error":"timeout","retryable":true}}]}
+		]
+	}`)
+	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
+	response := gjson.GetBytes(output, "contents.1.parts.0.functionResponse.response")
+	if response.Get("result.error").String() != "timeout" || !response.Get("result.retryable").Bool() {
+		t.Fatalf("raw result changed: %s", response.Raw)
+	}
+	if !response.Get("error").Bool() {
+		t.Fatalf("error marker missing: %s", response.Raw)
+	}
+}
+
 func TestConvertClaudeRequestToGemini_StringToolResult(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gemini-3-flash-preview",

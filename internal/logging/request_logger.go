@@ -418,7 +418,10 @@ type FileRequestLogger struct {
 	// errorLogsMaxFiles limits the number of error log files retained.
 	errorLogsMaxFiles int
 
-	homeEnabled bool
+	errorCleanupMu      sync.Mutex
+	errorCleanupRunning bool
+	errorCleanupPending bool
+	homeEnabled         bool
 }
 
 type homeRequestLogPayload struct {
@@ -871,7 +874,46 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 	if l.errorLogsMaxFiles <= 0 {
 		return nil
 	}
+	l.errorCleanupMu.Lock()
+	if l.errorCleanupRunning {
+		l.errorCleanupPending = true
+		l.errorCleanupMu.Unlock()
+		return nil
+	}
+	l.errorCleanupRunning = true
+	l.errorCleanupMu.Unlock()
+	return l.runErrorLogCleanup()
+}
 
+func (l *FileRequestLogger) runErrorLogCleanup() error {
+	var firstErr error
+	for pass := range 2 {
+		if errCleanup := l.cleanupOldErrorLogsPass(); errCleanup != nil && firstErr == nil {
+			firstErr = errCleanup
+		}
+
+		l.errorCleanupMu.Lock()
+		if !l.errorCleanupPending {
+			l.errorCleanupRunning = false
+			l.errorCleanupMu.Unlock()
+			return firstErr
+		}
+		l.errorCleanupPending = false
+		l.errorCleanupMu.Unlock()
+
+		if pass == 1 {
+			go func() {
+				if errCleanup := l.runErrorLogCleanup(); errCleanup != nil {
+					log.WithError(errCleanup).Warn("failed to continue error log cleanup")
+				}
+			}()
+			return firstErr
+		}
+	}
+	return firstErr
+}
+
+func (l *FileRequestLogger) cleanupOldErrorLogsPass() error {
 	entries, errRead := os.ReadDir(l.logsDir)
 	if errRead != nil {
 		return errRead
