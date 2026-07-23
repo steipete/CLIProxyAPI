@@ -10,6 +10,7 @@ import (
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
@@ -317,9 +318,13 @@ func validateClaudeContentDocument(content gjson.Result) error {
 }
 
 func requestContractError(format string, args ...any) error {
+	message := fmt.Sprintf(format, args...)
+	// Rejections are otherwise invisible server-side (only the gin 400 line);
+	// the reason names paths/rules, never payload content, so it is log-safe.
+	log.Warnf("claude request contract rejection: %s", message)
 	return &cliproxyexecutor.RequestError{
 		HTTPStatus: http.StatusBadRequest,
 		Code:       "invalid_request_error",
-		Message:    fmt.Sprintf(format, args...),
+		Message:    message,
 	}
 }
