@@ -91,9 +91,10 @@ func ValidateClaudeRequestForCodex(rawJSON []byte) error {
 					}
 				}
 			case "web_search_20250305", "web_search_20260209", "web_search_20260318":
-				if tool.Get("max_uses").Exists() {
-					return requestContractError("tools.%d.max_uses is not supported by the Codex web search boundary", index)
-				}
+				// max_uses is tolerated and dropped: it is a per-request cost cap,
+				// not a correctness contract, Codex applies its own search
+				// budgeting, and Claude Code sends it by default — rejecting it
+				// breaks web search for every stock client.
 				if err := validateClaudeWebSearchCallers(toolType, tool.Get("allowed_callers")); err != nil {
 					return requestContractError("tools.%d.allowed_callers: %v", index, err)
 				}
