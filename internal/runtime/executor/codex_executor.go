@@ -1649,21 +1649,57 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	}
 
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body = helps.SetBoolIfDifferent(body, "stream", false)
 	body = normalizeCodexInstructions(body)
-
-	enc, err := tokenizerForCodexModel(baseModel)
-	if err != nil {
-		return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: tokenizer init failed: %w", err)
+	// Server-side history (conversation/previous_response_id) prepends context
+	// the local tokenizer cannot see, so it forces the remote counter just
+	// like inline media does. Decide before the local-path cleanup deletes it.
+	// These are nullable request fields: an explicit null key is inactive, so
+	// presence checks must be null-aware.
+	fieldActive := func(path string) bool {
+		value := gjson.GetBytes(body, path)
+		return value.Exists() && value.Type != gjson.Null
+	}
+	stateful := fieldActive("previous_response_id") || fieldActive("conversation")
+	// Reusable prompt templates resolve server-side and the count endpoint has
+	// no prompt parameter, so neither counting path can price them.
+	if fieldActive("prompt") {
+		return cliproxyexecutor.Response{}, &cliproxyexecutor.RequestError{
+			HTTPStatus: http.StatusBadRequest,
+			Code:       "invalid_request_error",
+			Message:    "routed token counting does not support reusable prompt templates",
+		}
 	}
 
-	count, err := countCodexInputTokens(enc, body)
-	if err != nil {
-		return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: token counting failed: %w", err)
+	var count int64
+	if stateful || codexInputHasMediaParts(body) {
+		// Local tokenizers cannot price media (image tiling, PDF text plus page
+		// images), so media payloads count through the exact provider endpoint.
+		// Only API-key auths with a platform base URL are proven to expose
+		// /responses/input_tokens; the ChatGPT Codex backend stays fail-closed.
+		apiKey, baseURL := codexCreds(auth)
+		if strings.TrimSpace(baseURL) == "" {
+			return cliproxyexecutor.Response{}, errCodexTokenCountMediaUnsupported()
+		}
+		remoteCount, errRemote := countCodexInputTokensRemote(ctx, e.cfg, auth, apiKey, baseURL, body)
+		if errRemote != nil {
+			return cliproxyexecutor.Response{}, errRemote
+		}
+		count = remoteCount
+	} else {
+		body, _ = sjson.DeleteBytes(body, "previous_response_id")
+		body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
+		body, _ = sjson.DeleteBytes(body, "safety_identifier")
+		body, _ = sjson.DeleteBytes(body, "stream_options")
+		body = helps.SetBoolIfDifferent(body, "stream", false)
+		enc, errEnc := tokenizerForCodexModel(baseModel)
+		if errEnc != nil {
+			return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: tokenizer init failed: %w", errEnc)
+		}
+		localCount, errCount := countCodexInputTokens(enc, body)
+		if errCount != nil {
+			return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: token counting failed: %w", errCount)
+		}
+		count = localCount
 	}
 
 	usageJSON := fmt.Sprintf(`{"response":{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}}`, count, count)
@@ -1691,6 +1727,121 @@ func tokenizerForCodexModel(model string) (tokenizer.Codec, error) {
 	}
 }
 
+func errCodexTokenCountMediaUnsupported() *cliproxyexecutor.RequestError {
+	return &cliproxyexecutor.RequestError{
+		HTTPStatus: http.StatusBadRequest,
+		Code:       "invalid_request_error",
+		Message:    "routed token counting does not support image or document inputs for this credential",
+	}
+}
+
+// codexInputItemIsMessage accepts both tagged message items and the Responses
+// input union's type-less role/content form.
+func codexInputItemIsMessage(item gjson.Result) bool {
+	switch item.Get("type").String() {
+	case "message":
+		return true
+	case "":
+		return item.Get("role").Exists() && item.Get("content").Exists()
+	}
+	return false
+}
+
+// codexInputHasMediaParts mirrors the content shapes countCodexInputTokens
+// walks: message content parts and function_call_output output arrays.
+func codexInputHasMediaParts(body []byte) bool {
+	found := false
+	scanParts := func(content gjson.Result) {
+		if !content.IsArray() || found {
+			return
+		}
+		content.ForEach(func(_, part gjson.Result) bool {
+			switch part.Get("type").String() {
+			case "input_image", "input_file":
+				found = true
+				return false
+			}
+			return true
+		})
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return false
+	}
+	input.ForEach(func(_, item gjson.Result) bool {
+		// Scan every item's part-bearing fields regardless of item type so new
+		// union members cannot smuggle media past the exact remote counter;
+		// over-detection is safe because the endpoint accepts the full union.
+		scanParts(item.Get("content"))
+		scanParts(item.Get("output"))
+		// Item-level media shapes: computer screenshots, code-interpreter image
+		// outputs, and generated-image results are all provider-priced media.
+		if item.Get("output.type").String() == "computer_screenshot" {
+			found = true
+		}
+		if item.Get("type").String() == "image_generation_call" && item.Get("result").String() != "" {
+			found = true
+		}
+		if outputs := item.Get("outputs"); outputs.IsArray() {
+			outputs.ForEach(func(_, out gjson.Result) bool {
+				if out.Get("type").String() == "image" {
+					found = true
+					return false
+				}
+				return true
+			})
+		}
+		return !found
+	})
+	return found
+}
+
+// countCodexInputTokensRemote asks POST {base}/responses/input_tokens for the
+// exact count. The endpoint accepts the same input shape as Responses create.
+func countCodexInputTokensRemote(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, apiKey, baseURL string, body []byte) (int64, error) {
+	// The endpoint's schema is narrower than Responses create and 400s on
+	// create-only options, so project the payload onto its input-shaping
+	// fields instead of blacklisting knobs.
+	payload := []byte(`{}`)
+	// conversation/previous_response_id extend the counted context server-side
+	// and are part of the endpoint schema; dropping them would undercount.
+	for _, path := range []string{"model", "instructions", "input", "tools", "tool_choice", "parallel_tool_calls", "conversation", "previous_response_id", "reasoning", "text", "truncation", "personality"} {
+		if value := gjson.GetBytes(body, path); value.Exists() {
+			payload, _ = sjson.SetRawBytes(payload, path, []byte(value.Raw))
+		}
+	}
+	url := strings.TrimSuffix(baseURL, "/") + "/responses/input_tokens"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return 0, fmt.Errorf("codex executor: token count request failed: %w", err)
+	}
+	// Reuse the standard credential/header injection so configured overrides
+	// (organization/project/routing headers) reach the count endpoint too.
+	applyCodexHeaders(httpReq, auth, apiKey, false, cfg)
+	httpClient := helps.NewUtlsHTTPClient(ctx, cfg, auth, 0)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return 0, fmt.Errorf("codex executor: token count request failed: %w", err)
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("codex executor: close token count response body error: %v", errClose)
+		}
+	}()
+	data, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("codex executor: token count response read failed: %w", err)
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return 0, newCodexStatusErr(httpResp.StatusCode, data)
+	}
+	tokens := gjson.GetBytes(data, "input_tokens")
+	if !tokens.Exists() {
+		return 0, fmt.Errorf("codex executor: token count response missing input_tokens")
+	}
+	return tokens.Int(), nil
+}
+
 func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 	if enc == nil {
 		return 0, fmt.Errorf("encoder is nil")
@@ -1711,15 +1862,9 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 			part := parts[i]
 			switch part.Get("type").String() {
 			case "input_image", "input_file":
-				// Media token cost is model- and content-dependent (image tiling,
-				// PDF text plus page images); any local heuristic under- or
-				// overreports badly. Fail request-scoped until counting routes
-				// through the exact POST /v1/responses/input_tokens endpoint.
-				return &cliproxyexecutor.RequestError{
-					HTTPStatus: http.StatusBadRequest,
-					Code:       "invalid_request_error",
-					Message:    "routed token counting does not support image or document inputs",
-				}
+				// Backstop: CountTokens routes media payloads to the exact
+				// provider endpoint before reaching this local tokenizer path.
+				return errCodexTokenCountMediaUnsupported()
 			default:
 				if text := strings.TrimSpace(part.Get("text").String()); text != "" {
 					segments = append(segments, text)
@@ -1739,11 +1884,20 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 		for i := range arr {
 			item := arr[i]
 			structuralTokens += 4
-			switch item.Get("type").String() {
-			case "message":
-				if err := appendContentParts(item.Get("content")); err != nil {
+			if codexInputItemIsMessage(item) {
+				content := item.Get("content")
+				if content.Type == gjson.String {
+					if text := strings.TrimSpace(content.String()); text != "" {
+						segments = append(segments, text)
+					}
+					continue
+				}
+				if err := appendContentParts(content); err != nil {
 					return 0, err
 				}
+				continue
+			}
+			switch item.Get("type").String() {
 			case "function_call":
 				if name := strings.TrimSpace(item.Get("name").String()); name != "" {
 					segments = append(segments, name)

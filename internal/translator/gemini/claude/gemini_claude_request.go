@@ -128,15 +128,19 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						}
 						funcName = util.SanitizeFunctionName(funcName)
 						toolResult := util.ConvertClaudeToolResult(contentResult)
-						part := []byte(`{"functionResponse":{"name":"","response":{"result":""}}}`)
+						part := []byte(`{"functionResponse":{"name":"","response":{}}}`)
 						part, _ = sjson.SetBytes(part, "functionResponse.name", funcName)
-						if toolResult.ResultIsRaw {
-							part, _ = sjson.SetRawBytes(part, "functionResponse.response.result", []byte(toolResult.Result))
-						} else {
-							part, _ = sjson.SetBytes(part, "functionResponse.response.result", toolResult.Result)
-						}
+						// FunctionResponse contract: "error" carries error details and, once
+						// present, other response keys stop being treated as output — so a
+						// failed tool result must put its content under "error", not beside it.
+						resultPath := "functionResponse.response.result"
 						if toolResult.IsError {
-							part, _ = sjson.SetBytes(part, "functionResponse.response.error", true)
+							resultPath = "functionResponse.response.error"
+						}
+						if toolResult.ResultIsRaw {
+							part, _ = sjson.SetRawBytes(part, resultPath, []byte(toolResult.Result))
+						} else {
+							part, _ = sjson.SetBytes(part, resultPath, toolResult.Result)
 						}
 						partItems = append(partItems, part)
 						for _, img := range toolResult.Images {
