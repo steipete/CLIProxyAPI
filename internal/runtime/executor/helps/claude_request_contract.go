@@ -122,14 +122,13 @@ func ValidateClaudeRequestForCodex(rawJSON []byte) error {
 	thinkingType := strings.ToLower(strings.TrimSpace(root.Get("thinking.type").String()))
 	alwaysThinking := model == "claude-fable-5" || model == "claude-mythos-5"
 	manualThinkingRemoved := alwaysThinking || model == "claude-opus-4-7" || model == "claude-opus-4-8" || model == "claude-sonnet-5"
-	if alwaysThinking && thinkingType == "disabled" {
-		return requestContractError("thinking.type %q is not supported by %s", thinkingType, root.Get("model").String())
+	// Mirror Anthropic's documented 400 texts (thinking-troubleshooting) so
+	// rejected clients get the same remediation hint the real API sends.
+	if (alwaysThinking || model == "claude-mythos-preview") && thinkingType == "disabled" {
+		return requestContractError(`"thinking.type.disabled" is not supported for this model. Thinking defaults to adaptive mode when not specified; use "thinking.type.enabled" with "budget_tokens" for extended thinking.`)
 	}
 	if manualThinkingRemoved && thinkingType == "enabled" {
-		return requestContractError("thinking.type %q is not supported by %s", thinkingType, root.Get("model").String())
-	}
-	if model == "claude-mythos-preview" && thinkingType == "disabled" {
-		return requestContractError("thinking.type %q is not supported by %s", thinkingType, root.Get("model").String())
+		return requestContractError(`"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`)
 	}
 	return nil
 }
