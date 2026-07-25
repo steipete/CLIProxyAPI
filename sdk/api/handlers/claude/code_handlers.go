@@ -327,6 +327,8 @@ type claudeErrorResponse struct {
 	RequestID string            `json:"request_id,omitempty"`
 }
 
+const claudePromptTooLongMessage = "prompt is too long"
+
 func claudeStatusCode(msg *interfaces.ErrorMessage) int {
 	status := http.StatusInternalServerError
 	if msg == nil {
@@ -417,6 +419,7 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 		message = http.StatusText(status)
 	}
 	errType := claudeErrorTypeFromStatus(status)
+	errCode := ""
 
 	var payload map[string]any
 	if json.Valid([]byte(message)) {
@@ -425,14 +428,20 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 				if t, ok := e["type"].(string); ok && strings.TrimSpace(t) != "" {
 					errType = strings.TrimSpace(t)
 				}
+				if c, ok := e["code"].(string); ok {
+					errCode = strings.TrimSpace(c)
+				}
 				if m, ok := e["message"].(string); ok && strings.TrimSpace(m) != "" {
 					message = strings.TrimSpace(m)
-				} else if c, ok := e["code"].(string); ok && strings.TrimSpace(c) != "" {
-					message = strings.TrimSpace(c)
+				} else if errCode != "" {
+					message = errCode
 				}
 			} else {
 				if t, ok := payload["type"].(string); ok && strings.TrimSpace(t) != "" && strings.TrimSpace(t) != "error" {
 					errType = strings.TrimSpace(t)
+				}
+				if c, ok := payload["code"].(string); ok {
+					errCode = strings.TrimSpace(c)
 				}
 				if m, ok := payload["message"].(string); ok && strings.TrimSpace(m) != "" {
 					message = strings.TrimSpace(m)
@@ -441,7 +450,30 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 		}
 	}
 
-	return errType, message
+	return errType, normalizeClaudePromptTooLongError(status, errType, errCode, message)
+}
+
+func normalizeClaudePromptTooLongError(status int, errType, errCode, message string) string {
+	if status != http.StatusBadRequest || errType != "invalid_request_error" {
+		return message
+	}
+
+	code := strings.ToLower(strings.TrimSpace(errCode))
+	isContextCode := code == "context_too_large" ||
+		code == "context_length_exceeded" ||
+		code == "model_context_window_exceeded"
+
+	lowerMessage := strings.ToLower(message)
+	isContextMessage := strings.Contains(lowerMessage, "exceeds the context window") ||
+		strings.Contains(lowerMessage, "maximum context length") ||
+		(strings.Contains(lowerMessage, "input length") && strings.Contains(lowerMessage, "exceed context limit"))
+	if !isContextCode && !isContextMessage {
+		return message
+	}
+	if strings.Contains(lowerMessage, claudePromptTooLongMessage) {
+		return message
+	}
+	return claudePromptTooLongMessage + ": " + message
 }
 
 func claudeErrorTypeFromStatus(status int) string {
