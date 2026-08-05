@@ -140,6 +140,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if errStream == nil {
 			return result, nil
 		}
+		if bootstrapErr, accepted := upstreamAcceptedStreamError(errStream); accepted {
+			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause, true), nil
+		}
 		if isRequestTerminatedError(errStream) {
 			return nil, errStream
 		}
@@ -162,7 +165,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		var bootstrapErr *streamBootstrapError
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
-			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
+			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause, bootstrapErr.UpstreamAccepted()), nil
 		}
 		return nil, lastErr
 	}
@@ -680,6 +683,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil, unauthorizedRefreshTried)
 		if errStream != nil {
+			if _, accepted := upstreamAcceptedStreamError(errStream); accepted {
+				if selection != nil {
+					releaseAttempt()
+					if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "stream_start_failed"); errEnd != nil {
+						return nil, errEnd
+					}
+				}
+				return nil, errStream
+			}
 			if selection != nil {
 				releaseAttempt()
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "stream_start_failed"); errEnd != nil {

@@ -6,6 +6,7 @@ package logging
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -143,7 +144,10 @@ type FileRequestLogger struct {
 	// errorLogsMaxFiles limits the number of error log files retained.
 	errorLogsMaxFiles int
 
-	homeEnabled bool
+	errorCleanupMu      sync.Mutex
+	errorCleanupRunning bool
+	errorCleanupPending bool
+	homeEnabled         bool
 }
 
 // NewFileRequestLogger creates a new file-based request logger.

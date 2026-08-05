@@ -19,6 +19,20 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+func canTranslateCodexStreamLineWithoutClone(upstream, downstream sdktranslator.Format) bool {
+	// Response transformers are registered under the request direction (downstream, upstream).
+	return upstream == sdktranslator.FormatCodex &&
+		downstream == sdktranslator.FormatClaude &&
+		sdktranslator.HasStreamResponseTransformer(downstream, upstream)
+}
+
+func codexStreamLineForTranslation(line []byte, useDirect bool) []byte {
+	if useDirect {
+		return line
+	}
+	return bytes.Clone(line)
+}
+
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
@@ -37,6 +51,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		if errValidate := helps.ValidateClaudeRequestForCodex(req.Payload); errValidate != nil {
+			return nil, errValidate
+		}
+	}
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("codex")
 	originalPayloadSource := req.Payload
@@ -88,7 +107,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+	helps.RecordAPIRequestWithImmutableBody(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
@@ -126,6 +145,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		err = newCodexStatusErr(httpResp.StatusCode, data)
 		return nil, err
 	}
+	canTranslateStreamLineWithoutClone := canTranslateCodexStreamLineWithoutClone(to, responseFormat)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -143,7 +163,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		for scanner.Scan() {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			translatedLine := bytes.Clone(line)
+			translatedLine := codexStreamLineForTranslation(line, canTranslateStreamLineWithoutClone)
 			terminalSuccess := false
 
 			if bytes.HasPrefix(line, dataTag) {
@@ -213,5 +233,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		case <-ctx.Done():
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{
+		Headers:          httpResp.Header.Clone(),
+		Chunks:           out,
+		UpstreamAccepted: true,
+	}, nil
 }

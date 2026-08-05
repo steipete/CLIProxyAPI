@@ -10,11 +10,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
 	log "github.com/sirupsen/logrus"
 )
 
 var corsExposedResponseHeaders = []string{
 	logging.CPATraceIDHeader,
+	"request-id",
 	"X-CPA-VERSION",
 	"X-CPA-COMMIT",
 	"X-CPA-BUILD-DATE",
@@ -166,6 +168,10 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		statusCode := err.HTTPStatusCode()
 		if statusCode >= http.StatusInternalServerError {
 			log.Errorf("authentication middleware error: %v", err)
+		}
+		if strings.HasPrefix(c.Request.URL.Path, "/v1/messages") {
+			claude.WriteAuthenticationError(c, statusCode, err.Message)
+			return
 		}
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
 	}

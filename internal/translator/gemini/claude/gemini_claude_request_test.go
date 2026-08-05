@@ -242,6 +242,26 @@ func TestConvertClaudeRequestToGemini_StructuredToolResult(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToGemini_ErrorToolResultPreservesRawResult(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gemini-3-flash-preview",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"json-call-1","name":"json","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"json-call-1","is_error":true,"content":{"error":"timeout","retryable":true}}]}
+		]
+	}`)
+	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
+	response := gjson.GetBytes(output, "contents.1.parts.0.functionResponse.response")
+	// Error results route through the contract's "error" key; a sibling
+	// "result" would stop counting as output once "error" is present.
+	if response.Get("error.error").String() != "timeout" || !response.Get("error.retryable").Bool() {
+		t.Fatalf("error payload not in error channel: %s", response.Raw)
+	}
+	if response.Get("result").Exists() {
+		t.Fatalf("failed tool result must not keep a result key: %s", response.Raw)
+	}
+}
+
 func TestConvertClaudeRequestToGemini_StringToolResult(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gemini-3-flash-preview",

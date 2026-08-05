@@ -36,6 +36,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		if errValidate := helps.ValidateClaudeRequestForCodex(req.Payload); errValidate != nil {
+			return resp, errValidate
+		}
+	}
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("codex")
 	originalPayloadSource := req.Payload

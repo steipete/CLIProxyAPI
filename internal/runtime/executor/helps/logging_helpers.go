@@ -62,6 +62,17 @@ func requestLogCaptureEnabled(cfg *config.Config) bool {
 
 // RecordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	recordAPIRequest(ctx, cfg, info, true)
+}
+
+// RecordAPIRequestWithImmutableBody stores request metadata without cloning Body
+// when request logging is disabled. The caller must not mutate Body until the
+// request has finished and deferred error logging can no longer consume it.
+func RecordAPIRequestWithImmutableBody(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	recordAPIRequest(ctx, cfg, info, false)
+}
+
+func recordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog, cloneDeferredBody bool) {
 	if cfg == nil || cfg.CommercialMode {
 		return
 	}
@@ -70,7 +81,7 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 		return
 	}
 	if !cfg.RequestLog {
-		deferAPIRequest(ginCtx, info)
+		deferAPIRequest(ginCtx, info, cloneDeferredBody)
 		return
 	}
 
@@ -124,7 +135,7 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 	}
 }
 
-func deferAPIRequest(ginCtx *gin.Context, info UpstreamRequestLog) {
+func deferAPIRequest(ginCtx *gin.Context, info UpstreamRequestLog, cloneBody bool) {
 	if ginCtx == nil {
 		return
 	}
@@ -145,7 +156,10 @@ func deferAPIRequest(ginCtx *gin.Context, info UpstreamRequestLog) {
 	if captureLength > remaining {
 		captureLength = remaining
 	}
-	capturedInfo.Body = bytes.Clone(info.Body[:captureLength])
+	capturedInfo.Body = info.Body[:captureLength]
+	if cloneBody {
+		capturedInfo.Body = bytes.Clone(capturedInfo.Body)
+	}
 	bodyEmpty := len(info.Body) == 0
 	bodyTruncated := captureLength < len(info.Body)
 	ginCtx.Set(deferredAPIRequestBytesKey, bytesUsed+captureLength)

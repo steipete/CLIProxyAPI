@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 )
 
@@ -26,8 +27,57 @@ func TestClaudeErrorExtractsOpenAIStyleUpstreamJSON(t *testing.T) {
 	if got.Error.Type != "invalid_request_error" {
 		t.Fatalf("error.type = %q, want invalid_request_error", got.Error.Type)
 	}
-	if got.Error.Message != "Your input exceeds the context window of this model. Please adjust your input and try again." {
+	if got.Error.Message != "prompt is too long: Your input exceeds the context window of this model. Please adjust your input and try again." {
 		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+}
+
+func TestClaudeErrorNormalizesPromptTooLongVariants(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		errText string
+		want    string
+	}{
+		{
+			name:    "context code",
+			status:  http.StatusBadRequest,
+			errText: `{"error":{"message":"Request rejected.","type":"invalid_request_error","code":"context_length_exceeded"}}`,
+			want:    "prompt is too long: Request rejected.",
+		},
+		{
+			name:    "context message",
+			status:  http.StatusBadRequest,
+			errText: `{"error":{"message":"Maximum context length exceeded.","type":"invalid_request_error"}}`,
+			want:    "prompt is too long: Maximum context length exceeded.",
+		},
+		{
+			name:    "already canonical",
+			status:  http.StatusBadRequest,
+			errText: `{"error":{"message":"Prompt is too long.","type":"invalid_request_error","code":"context_too_large"}}`,
+			want:    "Prompt is too long.",
+		},
+		{
+			name:    "unrelated bad request",
+			status:  http.StatusBadRequest,
+			errText: `{"error":{"message":"Unsupported parameter.","type":"invalid_request_error","code":"unsupported_parameter"}}`,
+			want:    "Unsupported parameter.",
+		},
+		{
+			name:    "server error remains unchanged",
+			status:  http.StatusInternalServerError,
+			errText: `{"error":{"message":"Maximum context length exceeded.","type":"invalid_request_error","code":"context_too_large"}}`,
+			want:    "Maximum context length exceeded.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, got := claudeErrorDetailFromText(tt.status, tt.errText)
+			if got != tt.want {
+				t.Fatalf("message = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -45,6 +95,9 @@ func TestClaudeErrorExtractsClaudeStyleUpstreamJSON(t *testing.T) {
 	}
 	if got.Error.Message != "This request would exceed your account's rate limit. Please try again later." {
 		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+	if got.RequestID != "req_123" {
+		t.Fatalf("request_id = %q, want req_123", got.RequestID)
 	}
 }
 
@@ -70,25 +123,53 @@ func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	if got := gjson.GetBytes(body, "error.type").String(); got != "invalid_request_error" {
 		t.Fatalf("error.type = %q, want invalid_request_error; body=%s", got, body)
 	}
-	if got := gjson.GetBytes(body, "error.message").String(); got != "Your input exceeds the context window of this model. Please adjust your input and try again." {
+	if got := gjson.GetBytes(body, "error.message").String(); got != "prompt is too long: Your input exceeds the context window of this model. Please adjust your input and try again." {
 		t.Fatalf("error.message = %q; body=%s", got, body)
+	}
+	requestID := gjson.GetBytes(body, "request_id").String()
+	if requestID == "" || recorder.Header().Get(claudeRequestIDHeader) != requestID {
+		t.Fatalf("request ID body=%q header=%q", requestID, recorder.Header().Get(claudeRequestIDHeader))
 	}
 }
 
-func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
-	wantErr := &interfaces.ErrorMessage{
-		StatusCode: http.StatusBadRequest,
-		Error:      errors.New(`{"error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"invalid_request_error","code":"context_too_large"}}`),
-	}
-	errs := make(chan *interfaces.ErrorMessage, 1)
-	errs <- wantErr
-	close(errs)
+func TestWriteClaudeUnknownModelErrorUsesNotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
 
-	gotErr, ok := pendingClaudeStreamError(errs)
-	if !ok {
-		t.Fatal("expected pending stream error")
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadGateway,
+		Error:      &handlers.UnknownModelError{Model: "missing-model"},
+	})
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
 	}
-	if gotErr != wantErr {
-		t.Fatalf("pending error = %p, want %p", gotErr, wantErr)
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.type").String(); got != "not_found_error" {
+		t.Fatalf("error.type = %q; body=%s", got, recorder.Body.Bytes())
+	}
+}
+
+func TestWriteAuthenticationErrorUsesClaudeEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	WriteAuthenticationError(c, http.StatusUnauthorized, "Invalid API key")
+
+	body := recorder.Body.Bytes()
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	if got := gjson.GetBytes(body, "type").String(); got != "error" {
+		t.Fatalf("type = %q; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "error.type").String(); got != "authentication_error" {
+		t.Fatalf("error.type = %q; body=%s", got, body)
+	}
+	requestID := gjson.GetBytes(body, "request_id").String()
+	if requestID == "" || recorder.Header().Get(claudeRequestIDHeader) != requestID {
+		t.Fatalf("request ID body=%q header=%q", requestID, recorder.Header().Get(claudeRequestIDHeader))
 	}
 }

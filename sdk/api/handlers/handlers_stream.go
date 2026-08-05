@@ -307,9 +307,14 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	executedRequest := func() (coreexecutor.Request, coreexecutor.Options) {
 		return afterAuthCapture.apply(req, opts)
 	}
+	streamUpstreamAccepted := streamResult.UpstreamAccepted
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+	// Once the executor reports that the upstream accepted the request, avoid a
+	// synchronous pre-read unless headers or interceptors require it. Replaying an
+	// accepted request is unsafe, and the pre-read would only add first-token latency.
+	deferBootstrapRead := streamUpstreamAccepted && !passthroughHeadersEnabled && !streamInterceptorsActive
 	// Resolve bootstrap retries and header initialization before returning so the
 	// returned header snapshot is never modified by the stream goroutine.
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
@@ -432,6 +437,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 
 	bootstrapEligible := func(err error) bool {
+		if streamUpstreamAccepted {
+			return false
+		}
 		status := statusFromError(err)
 		if status == 0 {
 			return true
@@ -449,7 +457,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	if h.AuthManager.HomeEnabled() {
 		maxBootstrapRetries = 0
 	}
-	for bootstrapRetries := 0; !streamCanceledBeforeRead; {
+	for bootstrapRetries := 0; !deferBootstrapRead && !streamCanceledBeforeRead; {
 		readInitialStreamChunks()
 		if streamCanceledBeforeRead || bootstrapErr != nil || bootstrapStreamErr == nil {
 			break
@@ -473,6 +481,8 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			bootstrapErr = executionErrorMessage(fmt.Errorf("auth manager returned nil stream"))
 			break
 		}
+		streamUpstreamAccepted = retryResult.UpstreamAccepted
+		deferBootstrapRead = streamUpstreamAccepted && !passthroughHeadersEnabled && !streamInterceptorsActive
 		rawStreamHeaders = cloneHeader(retryResult.Headers)
 		baseStreamHeaders = cloneHeader(retryResult.Headers)
 		streamHeaderInitialized = false
