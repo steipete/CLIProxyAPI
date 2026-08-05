@@ -628,7 +628,12 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 	// into the upstream Claude Code SDK fingerprint.
 	r.Header.Set("X-Stainless-Runtime-Version", profile.RuntimeVersion)
 	r.Header.Set("X-Stainless-Package-Version", profile.PackageVersion)
-	r.Header.Set("X-Stainless-Os", profile.OS)
-	r.Header.Set("X-Stainless-Arch", profile.Arch)
+	if confirmedClaudeCode {
+		r.Header.Set("X-Stainless-Os", profile.OS)
+		r.Header.Set("X-Stainless-Arch", profile.Arch)
+	} else {
+		r.Header.Set("X-Stainless-Os", mapStainlessOS())
+		r.Header.Set("X-Stainless-Arch", mapStainlessArch())
+	}
 	r.Header.Set("User-Agent", profile.UserAgent)
 }
