@@ -602,6 +602,14 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 		return
 	}
 	profile := defaultClaudeDeviceProfile(cfg)
+	incomingOS := strings.TrimSpace(r.Header.Get("X-Stainless-Os")) != "" || strings.TrimSpace(ginHeaders.Get("X-Stainless-Os")) != ""
+	incomingArch := strings.TrimSpace(r.Header.Get("X-Stainless-Arch")) != "" || strings.TrimSpace(ginHeaders.Get("X-Stainless-Arch")) != ""
+	configuredOS := ""
+	configuredArch := ""
+	if cfg != nil {
+		configuredOS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
+		configuredArch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
+	}
 	miscEnsure := func(name, fallback string, valid func(string) bool) {
 		if current := strings.TrimSpace(r.Header.Get(name)); current != "" && (valid == nil || valid(current)) {
 			return
@@ -628,12 +636,19 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 	// into the upstream Claude Code SDK fingerprint.
 	r.Header.Set("X-Stainless-Runtime-Version", profile.RuntimeVersion)
 	r.Header.Set("X-Stainless-Package-Version", profile.PackageVersion)
-	if confirmedClaudeCode {
-		r.Header.Set("X-Stainless-Os", profile.OS)
-		r.Header.Set("X-Stainless-Arch", profile.Arch)
-	} else {
-		r.Header.Set("X-Stainless-Os", mapStainlessOS())
-		r.Header.Set("X-Stainless-Arch", mapStainlessArch())
+	targetOS := mapStainlessOS()
+	targetArch := mapStainlessArch()
+	if confirmedClaudeCode || !incomingOS {
+		if configuredOS != "" {
+			targetOS = profile.OS
+		}
 	}
+	if confirmedClaudeCode || !incomingArch {
+		if configuredArch != "" {
+			targetArch = profile.Arch
+		}
+	}
+	r.Header.Set("X-Stainless-Os", targetOS)
+	r.Header.Set("X-Stainless-Arch", targetArch)
 	r.Header.Set("User-Agent", profile.UserAgent)
 }
