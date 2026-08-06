@@ -87,6 +87,51 @@ func TestApplyBudgetConvertsForAliasModelID(t *testing.T) {
 	}
 }
 
+// The user-defined/alias path (no registry capabilities) must also convert
+// budget thinking for adaptive-only model IDs found in the body.
+func TestApplyCompatibleBudgetConvertsForAdaptiveOnlyModels(t *testing.T) {
+	applier := NewApplier()
+	body := []byte(`{"model":"claude-fable-5","max_tokens":16000,"thinking":{"type":"enabled","budget_tokens":3000}}`)
+	config := thinking.ThinkingConfig{Mode: thinking.ModeBudget, Budget: 3000}
+
+	userDefined := &registry.ModelInfo{ID: "native-claude-fable-5", Type: "claude", UserDefined: true}
+	out, err := applier.Apply(body, config, userDefined)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, out)
+	}
+	if gjson.GetBytes(out, "thinking.budget_tokens").Exists() {
+		t.Fatalf("budget_tokens should be removed, body=%s", out)
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "medium" {
+		t.Fatalf("effort = %q, want medium, body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.display").String(); got != "summarized" {
+		t.Fatalf("thinking.display = %q, want summarized, body=%s", got, out)
+	}
+}
+
+// Non-adaptive model IDs keep manual budget thinking on the compatible path.
+func TestApplyCompatibleBudgetStaysManualForOtherModels(t *testing.T) {
+	applier := NewApplier()
+	body := []byte(`{"model":"claude-opus-4-8","max_tokens":16000,"thinking":{"type":"enabled","budget_tokens":3000}}`)
+	config := thinking.ThinkingConfig{Mode: thinking.ModeBudget, Budget: 3000}
+
+	userDefined := &registry.ModelInfo{ID: "native-claude-opus-4-8", Type: "claude", UserDefined: true}
+	out, err := applier.Apply(body, config, userDefined)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled, body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.budget_tokens").Int(); got != 3000 {
+		t.Fatalf("budget_tokens = %d, want 3000, body=%s", got, out)
+	}
+}
+
 // A caller-chosen display value survives the budget conversion.
 func TestApplyBudgetConversionKeepsExplicitDisplay(t *testing.T) {
 	applier := NewApplier()

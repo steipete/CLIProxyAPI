@@ -311,8 +311,25 @@ func applyCompatibleClaude(body []byte, config thinking.ThinkingConfig) ([]byte,
 		result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
 		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
 		result, _ = sjson.SetBytes(result, "output_config.effort", string(config.Level))
+		result = defaultCompatibleAdaptiveDisplay(result)
 		return result, nil
 	default:
+		// Adaptive-only Claude 5 targets return empty thinking text for manual
+		// budget thinking; convert like the registry-backed path. User-defined
+		// and alias routes reach this branch without capability metadata, so
+		// match on the body's model ID.
+		if util.ClaudeAdaptiveOnlyThinkingModel(gjson.GetBytes(body, "model").String()) {
+			if level, ok := thinking.ConvertBudgetToLevel(config.Budget); ok && level != string(thinking.LevelNone) && level != string(thinking.LevelAuto) {
+				if level == string(thinking.LevelMinimal) {
+					level = string(thinking.LevelLow)
+				}
+				result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
+				result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
+				result, _ = sjson.SetBytes(result, "output_config.effort", level)
+				result = defaultCompatibleAdaptiveDisplay(result)
+				return result, nil
+			}
+		}
 		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
 		result, _ = sjson.SetBytes(result, "thinking.budget_tokens", config.Budget)
 		result, _ = sjson.DeleteBytes(result, "output_config.effort")
@@ -321,4 +338,18 @@ func applyCompatibleClaude(body []byte, config thinking.ThinkingConfig) ([]byte,
 		}
 		return result, nil
 	}
+}
+
+// defaultCompatibleAdaptiveDisplay mirrors defaultAdaptiveDisplay for the
+// user-defined/alias path where no registry ModelInfo is available: the model
+// ID in the body decides whether display defaults to omitted upstream.
+func defaultCompatibleAdaptiveDisplay(body []byte) []byte {
+	if !util.ClaudeThinkingDisplayOmittedForAlias(gjson.GetBytes(body, "model").String()) {
+		return body
+	}
+	if display := gjson.GetBytes(body, "thinking.display"); display.Type == gjson.String && display.String() != "" {
+		return body
+	}
+	body, _ = sjson.SetBytes(body, "thinking.display", "summarized")
+	return body
 }
