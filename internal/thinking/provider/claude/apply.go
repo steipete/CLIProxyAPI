@@ -11,6 +11,7 @@ package claude
 import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -102,6 +103,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 			result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
 			result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
 			result, _ = sjson.SetBytes(result, "output_config.effort", string(config.Level))
+			result = defaultAdaptiveDisplay(result, modelInfo)
 			return result, nil
 		}
 
@@ -128,6 +130,20 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 			return result, nil
 		}
 
+		// Claude 5 adaptive-only models accept enabled+budget_tokens but always
+		// return the thinking field empty (signature only), even when a display
+		// value asks for text. Convert the budget to the equivalent adaptive
+		// effort so reasoning stays visible to the caller.
+		if supportsAdaptive && modelInfo != nil && util.ClaudeAdaptiveOnlyThinkingModel(modelInfo.ID) {
+			if level, ok := thinking.ConvertBudgetToLevel(config.Budget); ok && level != string(thinking.LevelNone) && level != string(thinking.LevelAuto) {
+				result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
+				result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
+				result, _ = sjson.SetBytes(result, "output_config.effort", clampAdaptiveLevel(level, modelInfo))
+				result = defaultAdaptiveDisplay(result, modelInfo)
+				return result, nil
+			}
+		}
+
 		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
 		result, _ = sjson.SetBytes(result, "thinking.budget_tokens", config.Budget)
 		result, _ = sjson.DeleteBytes(result, "output_config.effort")
@@ -149,6 +165,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 			if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
 				result, _ = sjson.DeleteBytes(result, "output_config")
 			}
+			result = defaultAdaptiveDisplay(result, modelInfo)
 			return result, nil
 		}
 
@@ -164,6 +181,43 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	default:
 		return body, nil
 	}
+}
+
+// defaultAdaptiveDisplay adds thinking.display: "summarized" to adaptive
+// requests for models whose display defaults to omitted. Those models return
+// thinking blocks with an empty thinking field unless a display value is
+// present, and an absent display additionally makes the Claude Code cloaking
+// path append redact-thinking-2026-02-12, which forces the same emptiness.
+// Callers that explicitly chose a display value keep it.
+func defaultAdaptiveDisplay(body []byte, modelInfo *registry.ModelInfo) []byte {
+	if modelInfo == nil || !util.ClaudeThinkingDisplayOmittedByDefault(modelInfo.ID) {
+		return body
+	}
+	if display := gjson.GetBytes(body, "thinking.display"); display.Type == gjson.String && display.String() != "" {
+		return body
+	}
+	body, _ = sjson.SetBytes(body, "thinking.display", "summarized")
+	return body
+}
+
+// clampAdaptiveLevel maps a derived thinking level onto the model's advertised
+// adaptive levels. Levels below the supported floor rise to the first entry;
+// anything unsupported above it falls back to the last (highest) entry. The
+// advertised list is ordered lowest to highest in the model registry.
+func clampAdaptiveLevel(level string, modelInfo *registry.ModelInfo) string {
+	if modelInfo == nil || modelInfo.Thinking == nil || len(modelInfo.Thinking.Levels) == 0 {
+		return level
+	}
+	levels := modelInfo.Thinking.Levels
+	for _, supported := range levels {
+		if supported == level {
+			return level
+		}
+	}
+	if level == string(thinking.LevelMinimal) {
+		return levels[0]
+	}
+	return levels[len(levels)-1]
 }
 
 // normalizeClaudeBudget applies Claude-specific constraints to ensure max_tokens > budget_tokens.

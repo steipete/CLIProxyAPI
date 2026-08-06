@@ -23,6 +23,22 @@ func ClaudeThinkingDisplayOmittedByDefault(model string) bool {
 	return false
 }
 
+// ClaudeAdaptiveOnlyThinkingModel reports Claude 5-family models whose manual
+// budget thinking is accepted upstream but always returns an empty thinking
+// field, even with display: "summarized" (verified against api.anthropic.com
+// on claude-fable-5, 2026-08-06: enabled+budget_tokens bills thinking tokens
+// yet returns "" with a signature; adaptive+display returns text). Budget
+// requests for these models must be converted to adaptive thinking for the
+// content to be visible.
+func ClaudeAdaptiveOnlyThinkingModel(model string) bool {
+	switch model {
+	case "claude-fable-5", "claude-mythos-5", "claude-mythos-preview",
+		"claude-sonnet-5", "claude-opus-5":
+		return true
+	}
+	return false
+}
+
 const claudeDDModelPrefix = "claude-fable-5-dd-"
 
 // EnsureClaudeModelIDPrefix rewrites model IDs for Anthropic /models listings.
