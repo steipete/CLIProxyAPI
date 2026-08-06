@@ -190,7 +190,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 // path append redact-thinking-2026-02-12, which forces the same emptiness.
 // Callers that explicitly chose a display value keep it.
 func defaultAdaptiveDisplay(body []byte, modelInfo *registry.ModelInfo) []byte {
-	if modelInfo == nil || !util.ClaudeThinkingDisplayOmittedByDefault(modelInfo.ID) {
+	if modelInfo == nil || !util.ClaudeThinkingDisplayOmittedForAlias(modelInfo.ID) {
 		return body
 	}
 	if display := gjson.GetBytes(body, "thinking.display"); display.Type == gjson.String && display.String() != "" {

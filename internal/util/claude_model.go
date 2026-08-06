@@ -15,7 +15,7 @@ func IsClaudeThinkingModel(model string) bool {
 // adaptive thinking on these models must not request summaries unless the
 // caller explicitly sets display: "summarized".
 func ClaudeThinkingDisplayOmittedByDefault(model string) bool {
-	switch model {
+	switch CanonicalClaudeModelID(model) {
 	case "claude-fable-5", "claude-mythos-5", "claude-mythos-preview",
 		"claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7":
 		return true
@@ -23,18 +23,48 @@ func ClaudeThinkingDisplayOmittedByDefault(model string) bool {
 	return false
 }
 
-// ClaudeAdaptiveOnlyThinkingModel reports Claude 5-family models whose manual
+// ClaudeThinkingDisplayOmittedForAlias extends the display-omitted check to
+// registry alias IDs (oauth-model-alias) that embed a canonical model name,
+// e.g. native-claude-fable-5.
+func ClaudeThinkingDisplayOmittedForAlias(model string) bool {
+	if ClaudeThinkingDisplayOmittedByDefault(model) {
+		return true
+	}
+	lower := strings.ToLower(model)
+	for _, canonical := range []string{
+		"claude-fable-5", "claude-mythos-5", "claude-mythos-preview",
+		"claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7",
+	} {
+		if strings.Contains(lower, canonical) {
+			return true
+		}
+	}
+	return false
+}
+
+// claudeAdaptiveOnlyThinkingModels are Claude 5-family models whose manual
 // budget thinking is accepted upstream but always returns an empty thinking
 // field, even with display: "summarized" (verified against api.anthropic.com
 // on claude-fable-5, 2026-08-06: enabled+budget_tokens bills thinking tokens
 // yet returns "" with a signature; adaptive+display returns text). Budget
 // requests for these models must be converted to adaptive thinking for the
 // content to be visible.
+var claudeAdaptiveOnlyThinkingModels = []string{
+	"claude-fable-5", "claude-mythos-5", "claude-mythos-preview",
+	"claude-sonnet-5", "claude-opus-5",
+}
+
+// ClaudeAdaptiveOnlyThinkingModel reports whether the model ID names an
+// adaptive-only Claude 5 thinking model. Substring matching is deliberate:
+// oauth-model-alias clones a registry entry under an arbitrary alias ID
+// (e.g. native-claude-fable-5) while keeping canonical capabilities, and
+// suffixed forms such as claude-fable-5[1m] must also convert.
 func ClaudeAdaptiveOnlyThinkingModel(model string) bool {
-	switch model {
-	case "claude-fable-5", "claude-mythos-5", "claude-mythos-preview",
-		"claude-sonnet-5", "claude-opus-5":
-		return true
+	lower := strings.ToLower(model)
+	for _, canonical := range claudeAdaptiveOnlyThinkingModels {
+		if strings.Contains(lower, canonical) {
+			return true
+		}
 	}
 	return false
 }

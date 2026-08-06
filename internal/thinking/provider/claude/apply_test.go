@@ -8,6 +8,14 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// aliasFable5ModelInfo mirrors an oauth-model-alias clone: alias ID with
+// canonical capabilities.
+func aliasFable5ModelInfo() *registry.ModelInfo {
+	info := fable5ModelInfo()
+	info.ID = "native-claude-fable-5"
+	return info
+}
+
 func fable5ModelInfo() *registry.ModelInfo {
 	return &registry.ModelInfo{
 		ID:   "claude-fable-5",
@@ -54,6 +62,25 @@ func TestApplyBudgetConvertsToAdaptiveForAdaptiveOnlyModels(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "medium" {
 		t.Fatalf("effort = %q, want medium (budget 3000), body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.display").String(); got != "summarized" {
+		t.Fatalf("thinking.display = %q, want summarized, body=%s", got, out)
+	}
+}
+
+// Alias registry entries (oauth-model-alias, e.g. native-claude-fable-5) carry
+// the alias as ModelInfo.ID and must convert exactly like the canonical ID.
+func TestApplyBudgetConvertsForAliasModelID(t *testing.T) {
+	applier := NewApplier()
+	body := []byte(`{"model":"native-claude-fable-5","max_tokens":16000,"thinking":{"type":"enabled","budget_tokens":3000}}`)
+	config := thinking.ThinkingConfig{Mode: thinking.ModeBudget, Budget: 3000}
+
+	out, err := applier.Apply(body, config, aliasFable5ModelInfo())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, out)
 	}
 	if got := gjson.GetBytes(out, "thinking.display").String(); got != "summarized" {
 		t.Fatalf("thinking.display = %q, want summarized, body=%s", got, out)
