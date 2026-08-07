@@ -133,8 +133,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 
 	lines := bytes.Split(upstreamData, []byte("\n"))
-	outputItemsByIndex := make(map[int64][]byte)
-	var outputItemsFallback [][]byte
+	recovery := newCodexStreamTerminalRecovery()
 	for _, line := range lines {
 		if !bytes.HasPrefix(line, dataTag) {
 			continue
@@ -143,6 +142,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		eventData := bytes.TrimSpace(line[5:])
 		eventData = helps.RestoreCodexMultiAgentV2Response(eventData, optimizeMultiAgentV2)
 		eventType := gjson.GetBytes(eventData, "type").String()
+		recovery.observe(eventData)
 
 		if streamErr, terminalBody, ok := codexTerminalFailureErr(eventData); ok {
 			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
@@ -153,16 +153,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		if eventType == "response.output_item.done" {
-			itemResult := gjson.GetBytes(eventData, "item")
-			if !itemResult.Exists() || itemResult.Type != gjson.JSON {
-				continue
-			}
-			outputIndexResult := gjson.GetBytes(eventData, "output_index")
-			if outputIndexResult.Exists() {
-				outputItemsByIndex[outputIndexResult.Int()] = []byte(itemResult.Raw)
-			} else {
-				outputItemsFallback = append(outputItemsFallback, []byte(itemResult.Raw))
-			}
 			continue
 		}
 
@@ -175,11 +165,19 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 		publishCodexImageToolUsage(ctx, reporter, body, eventData)
 
-		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+		completedData := patchCodexCompletedOutput(eventData, recovery.outputItemsByIndex, recovery.outputItemsFallback)
 		if eventType == "response.completed" {
 			cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
 		}
 
+		var param any
+		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
+		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, clientCompletedData, &param)
+		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+		return resp, nil
+	}
+	if completedData, ok := recovery.completedEvent(); ok {
+		helps.LogWithRequestID(ctx).Warn("codex executor: recovered complete output after upstream closed before response.completed")
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
 		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, clientCompletedData, &param)

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -246,6 +247,133 @@ func TestCodexExecutorExecuteStreamMissingCompletionIsRequestScoped(t *testing.T
 		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusRequestTimeout, streamErr)
 	}
 	assertRequestScopedTestError(t, streamErr)
+}
+
+func TestCodexExecutorExecuteStreamRecoversCompletedToolCallOnEOF(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-sol","status":"in_progress"}}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"","status":"in_progress"}}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"a.txt\"}","status":"completed"}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":"read a.txt"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	completedCount := 0
+	var recovered []byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		payload := bytes.TrimSpace(chunk.Payload)
+		if !bytes.HasPrefix(payload, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(payload[5:])
+		if gjson.GetBytes(data, "type").String() == "response.completed" {
+			completedCount++
+			recovered = bytes.Clone(data)
+		}
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if completedCount != 1 {
+		t.Fatalf("response.completed count = %d, want 1", completedCount)
+	}
+	if got := gjson.GetBytes(recovered, "response.output.0.call_id").String(); got != "call_1" {
+		t.Fatalf("recovered call_id = %q, want call_1; payload=%s", got, recovered)
+	}
+	if got := gjson.GetBytes(recovered, "response.status").String(); got != "completed" {
+		t.Fatalf("recovered status = %q, want completed; payload=%s", got, recovered)
+	}
+}
+
+func TestCodexExecutorExecuteStreamRecoveredToolCallTerminatesClaudeOnce(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-sol","status":"in_progress"}}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"","status":"in_progress"}}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"a.txt\"}","status":"completed"}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","max_tokens":64,"messages":[{"role":"user","content":"read a.txt"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var stream bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		stream.Write(chunk.Payload)
+		stream.WriteByte('\n')
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if got := strings.Count(stream.String(), "event: message_stop"); got != 1 {
+		t.Fatalf("message_stop count = %d, want 1; stream=%s", got, stream.String())
+	}
+	if got := strings.Count(stream.String(), `"type":"tool_use"`); got != 1 {
+		t.Fatalf("tool_use count = %d, want 1; stream=%s", got, stream.String())
+	}
+}
+
+func TestCodexStreamTerminalRecoveryRejectsUnfinishedOutput(t *testing.T) {
+	recovery := newCodexStreamTerminalRecovery()
+	recovery.observe([]byte(`{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`))
+	recovery.observe([]byte(`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","status":"in_progress"}}`))
+
+	if completed, ok := recovery.completedEvent(); ok {
+		t.Fatalf("unfinished output unexpectedly recovered: %s", completed)
+	}
+}
+
+func TestCodexStreamTerminalRecoveryRequiresActionableOutput(t *testing.T) {
+	recovery := newCodexStreamTerminalRecovery()
+	recovery.observe([]byte(`{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`))
+	recovery.observe([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","status":"completed","summary":[]}}`))
+
+	if completed, ok := recovery.completedEvent(); ok {
+		t.Fatalf("reasoning-only output unexpectedly recovered: %s", completed)
+	}
 }
 
 func TestCodexExecutorExecuteStreamExplicitTerminalFailureIsNotSuccessful(t *testing.T) {

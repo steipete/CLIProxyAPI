@@ -18,6 +18,91 @@ type codexIncompleteStreamError struct {
 	statusErr
 }
 
+type codexStreamTerminalRecovery struct {
+	openFallback        int
+	openItemsByIndex    map[int64]struct{}
+	outputItemsByIndex  map[int64][]byte
+	outputItemsFallback [][]byte
+	responseCreated     []byte
+}
+
+func newCodexStreamTerminalRecovery() *codexStreamTerminalRecovery {
+	return &codexStreamTerminalRecovery{
+		openItemsByIndex:   make(map[int64]struct{}),
+		outputItemsByIndex: make(map[int64][]byte),
+	}
+}
+
+func (r *codexStreamTerminalRecovery) observe(eventData []byte) {
+	switch gjson.GetBytes(eventData, "type").String() {
+	case "response.created":
+		response := gjson.GetBytes(eventData, "response")
+		if response.Exists() && response.Type == gjson.JSON {
+			r.responseCreated = []byte(response.Raw)
+		}
+	case "response.output_item.added":
+		if outputIndex := gjson.GetBytes(eventData, "output_index"); outputIndex.Exists() {
+			r.openItemsByIndex[outputIndex.Int()] = struct{}{}
+		} else {
+			r.openFallback++
+		}
+	case "response.output_item.done":
+		if outputIndex := gjson.GetBytes(eventData, "output_index"); outputIndex.Exists() {
+			delete(r.openItemsByIndex, outputIndex.Int())
+		} else if r.openFallback > 0 {
+			r.openFallback--
+		}
+		collectCodexOutputItemDone(eventData, r.outputItemsByIndex, &r.outputItemsFallback)
+	}
+}
+
+func (r *codexStreamTerminalRecovery) completedEvent() ([]byte, bool) {
+	if len(r.responseCreated) == 0 || len(r.openItemsByIndex) > 0 || r.openFallback > 0 {
+		return nil, false
+	}
+
+	hasActionableOutput := false
+	for _, item := range r.outputItemsByIndex {
+		if !codexOutputItemSafeForTerminalRecovery(item) {
+			return nil, false
+		}
+		if codexOutputItemActionable(item) {
+			hasActionableOutput = true
+		}
+	}
+	for _, item := range r.outputItemsFallback {
+		if !codexOutputItemSafeForTerminalRecovery(item) {
+			return nil, false
+		}
+		if codexOutputItemActionable(item) {
+			hasActionableOutput = true
+		}
+	}
+	if !hasActionableOutput {
+		return nil, false
+	}
+
+	completed := []byte(`{"type":"response.completed","sequence_number":0,"response":{}}`)
+	completed, _ = sjson.SetRawBytes(completed, "response", r.responseCreated)
+	completed, _ = sjson.SetBytes(completed, "response.status", "completed")
+	completed, _ = sjson.SetRawBytes(completed, "response.error", []byte("null"))
+	return patchCodexCompletedOutput(completed, r.outputItemsByIndex, r.outputItemsFallback), true
+}
+
+func codexOutputItemSafeForTerminalRecovery(item []byte) bool {
+	status := strings.TrimSpace(gjson.GetBytes(item, "status").String())
+	return status == "" || status == "completed"
+}
+
+func codexOutputItemActionable(item []byte) bool {
+	switch gjson.GetBytes(item, "type").String() {
+	case "message", "function_call", "custom_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
 func newCodexIncompleteStreamError() codexIncompleteStreamError {
 	return codexIncompleteStreamError{statusErr: statusErr{
 		code: http.StatusRequestTimeout,
