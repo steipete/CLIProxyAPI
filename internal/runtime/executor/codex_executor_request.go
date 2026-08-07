@@ -23,11 +23,12 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
-	codexOriginator            = "codex-tui"
-	codexDefaultImageToolModel = "gpt-image-2"
-	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
-	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+	codexUserAgent                  = "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
+	codexOriginator                 = "codex-tui"
+	codexDefaultImageToolModel      = "gpt-image-2"
+	codexResponsesLiteHeader        = "X-OpenAI-Internal-Codex-Responses-Lite"
+	codexResponsesLiteMetadata      = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+	claudeCodexProgressInstructions = "Keep the user informed while you work. Before your first tool call and before each new substantial phase, send a brief natural-language progress update explaining what you are about to do. During long-running work, provide concise updates periodically. Do not narrate every trivial tool call or repeat yourself."
 )
 
 var dataTag = []byte("data:")
@@ -376,6 +377,22 @@ func normalizeCodexInstructions(body []byte) []byte {
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
 	return body
+}
+
+func applyCodexSourceInstructions(body []byte, from sdktranslator.Format) []byte {
+	body = normalizeCodexInstructions(body)
+	if !sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		return body
+	}
+
+	instructions := gjson.GetBytes(body, "instructions").String()
+	if strings.Contains(instructions, claudeCodexProgressInstructions) {
+		return body
+	}
+	if strings.TrimSpace(instructions) == "" {
+		return helps.SetStringIfDifferent(body, "instructions", claudeCodexProgressInstructions)
+	}
+	return helps.SetStringIfDifferent(body, "instructions", instructions+"\n\n"+claudeCodexProgressInstructions)
 }
 
 var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)

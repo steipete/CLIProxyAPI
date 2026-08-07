@@ -39,7 +39,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	}
 
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
-	body = normalizeCodexInstructions(body)
+	body = applyCodexSourceInstructions(body, from)
 
 	fieldActive := func(path string) bool {
 		value := gjson.GetBytes(body, path)
