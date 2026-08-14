@@ -23,12 +23,13 @@ import (
 )
 
 const (
-	codexUserAgent                  = "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
-	codexOriginator                 = "codex-tui"
-	codexDefaultImageToolModel      = "gpt-image-2"
-	codexResponsesLiteHeader        = "X-OpenAI-Internal-Codex-Responses-Lite"
-	codexResponsesLiteMetadata      = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
-	claudeCodexProgressInstructions = "Keep the user informed while you work. Before your first tool call and before each new substantial phase, send a brief natural-language progress update explaining what you are about to do. During long-running work, provide concise updates periodically. Do not narrate every trivial tool call or repeat yourself."
+	codexUserAgent                        = "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
+	codexOriginator                       = "codex-tui"
+	codexDefaultImageToolModel            = "gpt-image-2"
+	codexResponsesLiteHeader              = "X-OpenAI-Internal-Codex-Responses-Lite"
+	codexResponsesLiteMetadata            = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+	claudeCodexProgressInstructions       = "Keep the user oriented during tool-using work without narrating routine calls. Send one brief update before the first tool call. After that, update only for a material plan change, a distinct major phase, a blocker that changes the next step, or after a genuinely long wait with no visible progress. Do not update merely because a tool finished, a background task completed, or you are about to read, check, run, poll, or retry something within the same phase. Group related calls under the previous update, never restate recent intent, and prefer silence to low-value repetition."
+	claudeCodexLegacyProgressInstructions = "Keep the user informed while you work. Before your first tool call and before each new substantial phase, send a brief natural-language progress update explaining what you are about to do. During long-running work, provide concise updates periodically. Do not narrate every trivial tool call or repeat yourself."
 )
 
 var dataTag = []byte("data:")
@@ -386,6 +387,10 @@ func applyCodexSourceInstructions(body []byte, from sdktranslator.Format) []byte
 	}
 
 	instructions := gjson.GetBytes(body, "instructions").String()
+	if strings.Contains(instructions, claudeCodexLegacyProgressInstructions) {
+		instructions = strings.ReplaceAll(instructions, claudeCodexLegacyProgressInstructions, claudeCodexProgressInstructions)
+		body = helps.SetStringIfDifferent(body, "instructions", instructions)
+	}
 	if strings.Contains(instructions, claudeCodexProgressInstructions) {
 		return body
 	}

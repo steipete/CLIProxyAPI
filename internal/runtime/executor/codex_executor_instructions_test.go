@@ -42,10 +42,22 @@ func TestApplyCodexSourceInstructions(t *testing.T) {
 			applyTwice: true,
 		},
 		{
+			name: "claude migrates legacy instructions",
+			from: sdktranslator.FormatClaude,
+			body: `{"instructions":"` + claudeCodexLegacyProgressInstructions + `"}`,
+			want: claudeCodexProgressInstructions,
+		},
+		{
+			name: "claude migrates legacy instructions in place",
+			from: sdktranslator.FormatClaude,
+			body: `{"instructions":"Keep this before.\n\n` + claudeCodexLegacyProgressInstructions + `\n\nKeep this after."}`,
+			want: "Keep this before.\n\n" + claudeCodexProgressInstructions + "\n\nKeep this after.",
+		},
+		{
 			name: "responses unchanged",
 			from: sdktranslator.FormatOpenAIResponse,
-			body: `{"instructions":""}`,
-			want: "",
+			body: `{"instructions":"` + claudeCodexLegacyProgressInstructions + `"}`,
+			want: claudeCodexLegacyProgressInstructions,
 		},
 	}
 
