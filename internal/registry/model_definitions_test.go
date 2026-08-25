@@ -1,6 +1,48 @@
 package registry
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
+
+func TestCodexSubscriptionModelsExposeStablePublicModelAndReasoningLevels(t *testing.T) {
+	const modelID = "gpt-5.6-sol"
+	wantLevels := []string{"low", "medium", "high", "xhigh", "max"}
+
+	for _, subscription := range []struct {
+		name   string
+		models func() []*ModelInfo
+	}{
+		{name: "team", models: GetCodexTeamModels},
+		{name: "plus", models: GetCodexPlusModels},
+		{name: "pro", models: GetCodexProModels},
+	} {
+		t.Run(subscription.name, func(t *testing.T) {
+			for _, model := range subscription.models() {
+				if model == nil || model.ID != modelID {
+					continue
+				}
+				if model.Thinking == nil {
+					t.Fatalf("model %q has no reasoning-level support", modelID)
+				}
+				for _, level := range wantLevels {
+					if !slices.Contains(model.Thinking.Levels, level) {
+						t.Errorf("model %q does not support reasoning level %q", modelID, level)
+					}
+				}
+				return
+			}
+			t.Fatalf("subscription does not expose model %q", modelID)
+		})
+	}
+}
+
+func TestGetStaticModelDefinitionsByChannelSupportsGeminiInteractions(t *testing.T) {
+	models := GetStaticModelDefinitionsByChannel("gemini-interactions")
+	if len(models) == 0 {
+		t.Fatal("GetStaticModelDefinitionsByChannel(gemini-interactions) returned no models")
+	}
+}
 
 func TestModelOverrideHeadersFromEmbeddedModels(t *testing.T) {
 	const wantUA = "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)"
@@ -33,6 +75,19 @@ func TestGeminiVertexModelsUseFlashLiteReleaseID(t *testing.T) {
 	}
 
 	t.Fatalf("Vertex models do not contain %q", releaseID)
+}
+
+func TestWithXAIBuiltinsIncludesImage20(t *testing.T) {
+	models := WithXAIBuiltins(nil)
+	for _, model := range models {
+		if model != nil && model.ID == xaiBuiltinImage20ModelID {
+			if model.Created != 1786060800 {
+				t.Fatalf("created = %d, want 1786060800 (2026-08-07)", model.Created)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected xAI builtin model %s", xaiBuiltinImage20ModelID)
 }
 
 func TestWithXAIBuiltinsIncludesVideo15GAAndPreviewAlias(t *testing.T) {

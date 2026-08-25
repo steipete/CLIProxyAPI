@@ -1,14 +1,8 @@
 package responses
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	"math/big"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -16,12 +10,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-)
-
-var (
-	user    = ""
-	account = ""
-	session = ""
 )
 
 // ConvertOpenAIResponsesRequestToClaude transforms an OpenAI Responses API request
@@ -48,22 +36,11 @@ func ConvertOpenAIResponsesRequestToClaudeWithCompat(modelName string, inputRawJ
 func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte, stream, preserveEmptyThinkingBlocks bool) []byte {
 	rawJSON := inputRawJSON
 
-	if account == "" {
-		u, _ := uuid.NewRandom()
-		account = u.String()
-	}
-	if session == "" {
-		u, _ := uuid.NewRandom()
-		session = u.String()
-	}
-	if user == "" {
-		sum := sha256.Sum256([]byte(account + session))
-		user = hex.EncodeToString(sum[:])
-	}
-	userID := fmt.Sprintf("user_%s_account_%s_session_%s", user, account, session)
+	userID := common.DeriveClaudeUserID(rawJSON)
 
 	// Base Claude message payload
-	out := []byte(fmt.Sprintf(`{"model":"","max_tokens":32000,"messages":[],"metadata":{"user_id":"%s"}}`, userID))
+	out := []byte(`{"model":"","max_tokens":32000,"messages":[],"metadata":{}}`)
+	out, _ = sjson.SetBytes(out, "metadata.user_id", userID)
 
 	root := gjson.ParseBytes(rawJSON)
 
@@ -116,17 +93,6 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		}
 	}
 
-	// Helper for generating tool call IDs when missing
-	genToolCallID := func() string {
-		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-		var b strings.Builder
-		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-			b.WriteByte(letters[n.Int64()])
-		}
-		return "toolu_" + b.String()
-	}
-
 	// Model
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
@@ -137,6 +103,11 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 	// Stream
 	out, _ = sjson.SetBytes(out, "stream", stream)
+
+	// Service Tier -> Speed
+	if st := root.Get("service_tier"); st.Type == gjson.String && st.String() == "priority" {
+		out, _ = sjson.SetBytes(out, "speed", "fast")
+	}
 
 	// System-level inputs become canonical top-level Claude system blocks in
 	// source order: instructions first, then every input item whose role is
@@ -253,6 +224,21 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		pendingRole = "assistant"
 		pendingToolUseParts = append(pendingToolUseParts, toolUse)
 	}
+
+	lastToolResult := map[string]gjson.Result{}
+	if input := root.Get("input"); input.Exists() && input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			switch item.Get("type").String() {
+			case "function_call_output", "custom_tool_call_output":
+				rawID := item.Get("call_id").String()
+				if rawID != "" {
+					lastToolResult[rawID] = item
+				}
+			}
+			return true
+		})
+	}
+	emittedToolResults := map[string]struct{}{}
 
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
@@ -383,7 +369,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				// object because Claude tool_use input must be a JSON object.
 				callID := item.Get("call_id").String()
 				if callID == "" {
-					callID = genToolCallID()
+					callID = common.GenerateClaudeToolCallID()
 				}
 				callID = util.SanitizeClaudeToolID(callID)
 				name := item.Get("name").String()
@@ -412,9 +398,20 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 			case "function_call_output", "custom_tool_call_output":
 				// Map to user tool_result
-				callID := item.Get("call_id").String()
-				callID = util.SanitizeClaudeToolID(callID)
+				rawID := item.Get("call_id").String()
+				callID := util.SanitizeClaudeToolID(rawID)
+				if rawID != "" {
+					if _, exists := emittedToolResults[rawID]; exists {
+						return true
+					}
+					emittedToolResults[rawID] = struct{}{}
+				}
 				output := item.Get("output")
+				if rawID != "" {
+					if lastItem, exists := lastToolResult[rawID]; exists {
+						output = lastItem.Get("output")
+					}
+				}
 				toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
 				toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
 				toolResult = applyResponsesToolResultContent(toolResult, output)
@@ -1054,7 +1051,7 @@ func splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON []byte, quali
 	if !ok {
 		return qualifiedName, ""
 	}
-	if descriptor.toolType == "function" && !descriptor.direct {
+	if !descriptor.direct {
 		return descriptor.childName, descriptor.namespace
 	}
 	return qualifiedName, ""

@@ -61,8 +61,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		reporter.UpdateAccessTokenFingerprint(auth)
 	}
 
-	originalTranslated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, true)
-	translated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, true)
+	originalTranslated, translated := helps.TranslateRequestPairWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
 
 	translated, err = helps.ApplyThinkingWithSourcePayload(translated, req.Payload, originalPayloadSource, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -83,7 +82,9 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 
-	attempts := antigravityRetryAttempts(auth, e.cfg)
+	// Credential retry rounds are owned by the conductor. Keep one upstream
+	// attempt per credential so request-retry is not consumed twice.
+	attempts := 1
 
 attemptLoop:
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -108,6 +109,7 @@ attemptLoop:
 					return nil, err
 				}
 			}
+			requestPayload = ensureAntigravityGeminiLeadingUserContent(baseModel, requestPayload)
 			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
 			if errReq != nil {
 				err = errReq

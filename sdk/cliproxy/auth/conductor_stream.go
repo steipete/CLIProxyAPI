@@ -3,11 +3,32 @@ package auth
 import (
 	"context"
 	"errors"
+	"maps"
 	"net/http"
 	"strings"
+	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+const (
+	streamResultPrimarySessionMetadataKey  = "cliproxy.stream_result_primary_session_id"
+	streamResultFallbackSessionMetadataKey = "cliproxy.stream_result_fallback_session_id"
+)
+
+func streamResultOptions(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	primary, fallback := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	opts.OriginalRequest = nil
+	if primary != "" || fallback != "" {
+		opts.Metadata = maps.Clone(opts.Metadata)
+		if opts.Metadata == nil {
+			opts.Metadata = make(map[string]any, 2)
+		}
+		opts.Metadata[streamResultPrimarySessionMetadataKey] = primary
+		opts.Metadata[streamResultFallbackSessionMetadataKey] = fallback
+	}
+	return opts
+}
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
 	if ch == nil {
@@ -133,8 +154,10 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, cancel context.CancelFunc, auth *Auth, provider, resultModel string, upstreamAccepted bool, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, cancel context.CancelFunc, auth *Auth, provider, resultModel string, upstreamAccepted bool, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool, opts cliproxyexecutor.Options) *cliproxyexecutor.StreamResult {
+	opts = streamResultOptions(opts)
 	out := make(chan cliproxyexecutor.StreamChunk)
+	streamStart := time.Now()
 	go func() {
 		defer close(out)
 		if cancel != nil {
@@ -149,8 +172,13 @@ func (m *Manager) wrapStreamResult(ctx context.Context, cancel context.CancelFun
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
+				entry := logEntryWithRequestID(ctx)
+				warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), chunk.Err)
 				rerr := resultErrorFromError(chunk.Err)
-				m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}, auth, ephemeralResult)
+				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: opts}
+				applyRequestScopedActionToResult(action, okAction, &result)
+				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			}
 			if !forward {
 				return false
@@ -207,7 +235,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, cancel context.CancelFun
 			}
 		}
 		if !failed && (ephemeralResult || claudeOAuthRequestCancellation(ctx, auth, nil) == nil) {
-			m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true}, auth, ephemeralResult)
+			m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true, Options: opts}, auth, ephemeralResult)
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{
@@ -254,7 +282,6 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if errCtx := ctx.Err(); errCtx != nil {
 			return nil, errCtx
 		}
-
 		executeAttempt := func(currentAuth *Auth) (*cliproxyexecutor.StreamResult, context.CancelFunc, error) {
 			attemptCtx := ctx
 			cancelAttempt := context.CancelFunc(func() {})
@@ -269,7 +296,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			return streamResult, cancelAttempt, nil
 		}
 
+		entry := logEntryWithRequestID(ctx)
+		startStream := time.Now()
 		streamResult, cancelAttempt, errStream := executeAttempt(auth)
+		durationStream := time.Since(startStream)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -286,18 +316,26 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				if errRefresh != nil {
 					errStream = errRefresh
+					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationStream, errStream)
 				} else if okRefresh {
 					auth = refreshed
 					m.replaceHomeExecutionLifecycleAuth(execOpts.ExecutionLifecycle, auth)
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					startRetry := time.Now()
 					streamResult, cancelAttempt, errStream = executeAttempt(auth)
+					durationRetry := time.Since(startRetry)
 					if errStream != nil {
+						warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationRetry, errStream)
 						if errCtx := ctx.Err(); errCtx != nil {
 							return nil, errCtx
 						}
 					}
+				} else {
+					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationStream, errStream)
 				}
+			} else {
+				warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationStream, errStream)
 			}
 		}
 		if !ephemeralResult {
@@ -311,19 +349,37 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				cancelAttempt()
 			}
 			rerr := resultErrorFromError(errStream)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			action, okAction := matchRequestScopedErrorAction(auth, errStream, m.runtimeConfigSnapshot())
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: execOpts}
 			result.RetryAfter = retryAfterFromError(errStream)
+			if isCredentialScopedError(errStream) {
+				result.CredentialScope = true
+			}
+			applyRequestScopedActionToResult(action, okAction, &result)
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+			if okAction {
+				if isRequestScopedStop(action, okAction) {
+					return nil, wrapRequestStopError(errStream)
+				}
+				lastErr = errStream
+				if result.CredentialScope {
+					return nil, errStream
+				}
+				continue
+			}
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
 			lastErr = errStream
+			if result.CredentialScope {
+				return nil, errStream
+			}
 			continue
 		}
 
 		if streamResult.UpstreamAccepted {
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, execModel, aliasResult)
-			return m.wrapStreamResult(ctx, cancelAttempt, auth.Clone(), provider, resultModel, true, streamResult.Headers, nil, streamResult.Chunks, attemptAliasResult, ephemeralResult), nil
+			return m.wrapStreamResult(ctx, cancelAttempt, auth.Clone(), provider, resultModel, true, streamResult.Headers, nil, streamResult.Chunks, attemptAliasResult, ephemeralResult, execOpts), nil
 		}
 
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
@@ -351,6 +407,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					}
 					discardStreamChunks(streamResult.Chunks)
 					bootstrapErr = errRefresh
+					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), bootstrapErr)
 					streamResult = &cliproxyexecutor.StreamResult{}
 					cancelAttempt = nil
 				} else if okRefresh {
@@ -362,6 +419,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					m.replaceHomeExecutionLifecycleAuth(execOpts.ExecutionLifecycle, auth)
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					startRetry := time.Now()
 					retryStream, retryCancel, retryErr := executeAttempt(auth)
 					retryStream, retryErr = validateStreamResult(retryStream, retryErr)
 					if retryErr != nil {
@@ -372,6 +430,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 							return nil, errCtx
 						}
 						bootstrapErr = retryErr
+						warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startRetry), bootstrapErr)
 						streamResult = &cliproxyexecutor.StreamResult{}
 						cancelAttempt = nil
 					} else {
@@ -379,11 +438,18 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						cancelAttempt = retryCancel
 						if streamResult.UpstreamAccepted {
 							attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, execModel, aliasResult)
-							return m.wrapStreamResult(ctx, cancelAttempt, auth.Clone(), provider, resultModel, true, streamResult.Headers, nil, streamResult.Chunks, attemptAliasResult, ephemeralResult), nil
+							return m.wrapStreamResult(ctx, cancelAttempt, auth.Clone(), provider, resultModel, true, streamResult.Headers, nil, streamResult.Chunks, attemptAliasResult, ephemeralResult, execOpts), nil
 						}
 						buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
+						if bootstrapErr != nil {
+							warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startRetry), bootstrapErr)
+						}
 					}
+				} else {
+					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), bootstrapErr)
 				}
+			} else {
+				warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), bootstrapErr)
 			}
 		}
 		if !ephemeralResult {
@@ -393,9 +459,38 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 		}
 		if bootstrapErr != nil {
+			action, okAction := matchRequestScopedErrorAction(auth, bootstrapErr, m.runtimeConfigSnapshot())
+			if okAction {
+				rerr := resultErrorFromError(bootstrapErr)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: execOpts}
+				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				if isCredentialScopedError(bootstrapErr) {
+					result.CredentialScope = true
+				}
+				applyRequestScopedActionToResult(action, okAction, &result)
+				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+				if cancelAttempt != nil {
+					cancelAttempt()
+				}
+				discardStreamChunks(streamResult.Chunks)
+				if streamResult.UpstreamAccepted {
+					return nil, newStreamBootstrapErrorWithAcceptance(bootstrapErr, streamResult.Headers, true)
+				}
+				if isRequestScopedStop(action, okAction) {
+					return nil, wrapRequestStopError(bootstrapErr)
+				}
+				lastErr = bootstrapErr
+				if result.CredentialScope {
+					return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+				}
+				continue
+			}
 			rerr := resultErrorFromError(bootstrapErr)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: execOpts}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
+			if isCredentialScopedError(bootstrapErr) {
+				result.CredentialScope = true
+			}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			if cancelAttempt != nil {
 				cancelAttempt()
@@ -409,6 +504,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			if idx < len(execModels)-1 {
 				lastErr = bootstrapErr
+				if result.CredentialScope {
+					return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+				}
 				continue
 			}
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
@@ -416,7 +514,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
+			warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), emptyErr)
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, Options: execOpts}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			if cancelAttempt != nil {
 				cancelAttempt()
@@ -438,7 +537,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			remaining = closedCh
 		}
 		attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, execModel, aliasResult)
-		return m.wrapStreamResult(ctx, cancelAttempt, auth.Clone(), provider, resultModel, streamResult.UpstreamAccepted, streamResult.Headers, buffered, remaining, attemptAliasResult, ephemeralResult), nil
+		return m.wrapStreamResult(ctx, cancelAttempt, auth.Clone(), provider, resultModel, streamResult.UpstreamAccepted, streamResult.Headers, buffered, remaining, attemptAliasResult, ephemeralResult, execOpts), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
