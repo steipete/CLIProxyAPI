@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -922,6 +923,35 @@ func TestExecuteStreamWithAuthManager_RetriesAfterDroppedBootstrapPayload(t *tes
 	}
 }
 
+func TestExecuteStreamWithAuthManager_ResetsResponsesValidatorOnBootstrapRetry(t *testing.T) {
+	executor := &bootstrapStreamExecutor{stream: func(_ context.Context, call int) (*coreexecutor.StreamResult, error) {
+		chunks := make(chan coreexecutor.StreamChunk, 2)
+		if call == 1 {
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",")}
+			chunks <- coreexecutor.StreamChunk{Err: &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"}}
+		} else {
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")}
+		}
+		close(chunks)
+		return &coreexecutor.StreamResult{Chunks: chunks}, nil
+	}}
+	handler, _ := registerBootstrapExecutor(t, executor)
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai-response", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error after retry: %+v", msg)
+		}
+	}
+	if executor.Calls() != 2 || !strings.Contains(string(got), "response.completed") {
+		t.Fatalf("retry calls=%d payload=%q", executor.Calls(), got)
+	}
+}
+
 func TestExecuteStreamWithAuthManager_CancelDuringSynchronousBootstrap(t *testing.T) {
 	started := make(chan struct{})
 	executor := &bootstrapStreamExecutor{stream: func(_ context.Context, _ int) (*coreexecutor.StreamResult, error) {
@@ -1522,6 +1552,46 @@ func TestExecuteStreamWithAuthManager_AllowsSplitOpenAIResponsesSSEEventLines(t 
 	expectedData := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}"
 	if got[1] != expectedData {
 		t.Fatalf("unexpected second chunk.\nGot:  %q\nWant: %q", got[1], expectedData)
+	}
+}
+
+func TestSSEJSONValidationStateBoundsIncompleteDataFrame(t *testing.T) {
+	state := &sseJSONValidationState{}
+	chunk := append([]byte(`data: {"message":"`), bytes.Repeat([]byte("x"), 2*1024*1024)...)
+	output, errValidate := state.AddChunk(chunk)
+	if errValidate == nil || !strings.Contains(errValidate.Error(), "SSE data frame exceeds") {
+		t.Fatalf("oversized incomplete SSE frame = (%d bytes, %v), want bounded-frame error", len(output), errValidate)
+	}
+	if len(state.pending) > 1024*1024 {
+		t.Fatalf("validator retained %d pending bytes after rejecting oversized frame", len(state.pending))
+	}
+}
+
+func TestSSEJSONValidationStateAllowsLargeCompleteDataFrame(t *testing.T) {
+	state := &sseJSONValidationState{}
+	chunk := append([]byte(`data: {"message":"`), bytes.Repeat([]byte("x"), 2*1024*1024)...)
+	chunk = append(chunk, []byte("\"}\n\n")...)
+	output, errValidate := state.AddChunk(chunk)
+	if errValidate != nil {
+		t.Fatalf("complete SSE frame was rejected: %v", errValidate)
+	}
+	if !bytes.Equal(output, chunk) {
+		t.Fatalf("complete SSE frame changed: got %d bytes, want %d", len(output), len(chunk))
+	}
+}
+
+func TestSSEJSONValidationStatePreservesCompleteFrameBeforeOversizedPending(t *testing.T) {
+	state := &sseJSONValidationState{}
+	complete := []byte("data: {\"message\":\"first\"}\n\n")
+	chunk := append(bytes.Clone(complete), []byte(`data: {"message":"`)...)
+	chunk = append(chunk, bytes.Repeat([]byte("x"), 2*1024*1024)...)
+
+	output, errValidate := state.AddChunk(chunk)
+	if errValidate != nil || !bytes.Equal(output, complete) {
+		t.Fatalf("complete frame before oversized tail = (%q, %v)", output, errValidate)
+	}
+	if _, errValidate = state.AddChunk(nil); errValidate == nil || !strings.Contains(errValidate.Error(), "SSE data frame exceeds") {
+		t.Fatalf("deferred oversized frame error = %v", errValidate)
 	}
 }
 

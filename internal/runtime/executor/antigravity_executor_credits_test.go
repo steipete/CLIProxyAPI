@@ -21,6 +21,11 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
+// resetAntigravityCreditsRetryState clears the package-level credits state
+// between tests. It empties each map in place instead of assigning a fresh
+// sync.Map, because credits hint refreshes run on background goroutines that
+// may still be writing these maps when a test's cleanup runs. Replacing the
+// variable is an unsynchronized write and races with them; Clear is not.
 func resetAntigravityCreditsRetryState() {
 	antigravityCreditsHintRefreshByID.Range(func(_, value any) bool {
 		state, ok := value.(*antigravityCreditsHintRefreshState)
@@ -31,10 +36,10 @@ func resetAntigravityCreditsRetryState() {
 		state.mu.Unlock()
 		return true
 	})
-	antigravityCreditsFailureByAuth = sync.Map{}
-	antigravityShortCooldownByAuth = sync.Map{}
-	antigravityCreditsBalanceByAuth = sync.Map{}
-	antigravityCreditsHintRefreshByID = sync.Map{}
+	antigravityCreditsFailureByAuth.Clear()
+	antigravityShortCooldownByAuth.Clear()
+	antigravityCreditsBalanceByAuth.Clear()
+	antigravityCreditsHintRefreshByID.Clear()
 }
 
 type closeSignalReadCloser struct {
@@ -282,27 +287,19 @@ func TestParseRetryDelay_HumanReadableDuration(t *testing.T) {
 	}
 }
 
-func TestAntigravityExecute_RetriesTransient429ResourceExhausted(t *testing.T) {
+func TestAntigravityExecute_DoesNotUseRequestRetryForInternalRetries(t *testing.T) {
 	resetAntigravityCreditsRetryState()
 	t.Cleanup(resetAntigravityCreditsRetryState)
 
 	var requestCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
-		switch requestCount {
-		case 1:
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`))
-		case 2:
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}}`))
-		default:
-			t.Fatalf("unexpected request count %d", requestCount)
-		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`))
 	}))
 	defer server.Close()
 
-	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 3})
 	auth := &cliproxyauth.Auth{
 		ID: "auth-transient-429",
 		Attributes: map[string]string{
@@ -321,14 +318,14 @@ func TestAntigravityExecute_RetriesTransient429ResourceExhausted(t *testing.T) {
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatAntigravity,
 	})
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
+	if err == nil {
+		t.Fatalf("Execute() error = nil, want upstream 429")
 	}
-	if len(resp.Payload) == 0 {
-		t.Fatal("Execute() returned empty payload")
+	if len(resp.Payload) != 0 {
+		t.Fatalf("Execute() returned payload %q, want empty payload", resp.Payload)
 	}
-	if requestCount != 2 {
-		t.Fatalf("request count = %d, want 2", requestCount)
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want 1", requestCount)
 	}
 }
 

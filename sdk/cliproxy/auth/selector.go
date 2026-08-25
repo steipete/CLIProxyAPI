@@ -541,6 +541,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+		return true, blockReasonCooldown, auth.Quota.NextRecoverAt
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			modelKey := canonicalModelKey(model)
@@ -572,7 +575,6 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 			if matched {
 				return blocked, blockedReason, nextRetry
 			}
-			// Auth-level availability can aggregate failures from other models.
 			return false, blockReasonNone, time.Time{}
 		}
 		return availabilityBlock(auth.Unavailable, auth.Quota.Exceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
@@ -654,6 +656,11 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
+	if opts.Metadata == nil {
+		opts.Metadata = make(map[string]any)
+	}
+	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
+	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	now := time.Now()
 	availabilityCandidates := auths
@@ -677,10 +684,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	fallbackAuths := highestPriorityAuths(available)
 
-	cacheKey := provider + "::" + primaryID + "::" + model
+	modelKey := canonicalModelKey(model)
+	cacheKey := provider + "::" + primaryID + "::" + modelKey
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey = provider + "::" + fallbackID + "::" + model
+		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
 	}
 	bind := func(authID string) {
 		if fallbackKey != "" {
@@ -759,6 +767,52 @@ func (s *SessionAffinitySelector) Stop() {
 func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)
+	}
+}
+
+// OnResult handles session affinity binding or release based on execution outcome.
+func (s *SessionAffinitySelector) OnResult(res Result) {
+	if s == nil || s.cache == nil || res.AuthID == "" {
+		return
+	}
+	primaryID, fallbackID := extractSessionIDs(res.Options.Headers, res.Options.OriginalRequest, res.Options.Metadata)
+	if preservedPrimary, ok := res.Options.Metadata[streamResultPrimarySessionMetadataKey].(string); ok {
+		primaryID = preservedPrimary
+		fallbackID, _ = res.Options.Metadata[streamResultFallbackSessionMetadataKey].(string)
+	}
+	if primaryID == "" && fallbackID == "" {
+		return
+	}
+
+	ns := res.Provider
+	if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey].(string); ok && raw != "" {
+		ns = raw
+	}
+	nsModel := canonicalModelKey(res.Model)
+	if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey].(string); ok && raw != "" {
+		nsModel = canonicalModelKey(raw)
+	}
+
+	cacheKey := ns + "::" + primaryID + "::" + nsModel
+	var fallbackKey string
+	if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
+	}
+	if res.Success {
+		s.cache.Touch(cacheKey, res.AuthID)
+		if fallbackKey != "" {
+			s.cache.Touch(fallbackKey, res.AuthID)
+		}
+		return
+	}
+
+	if res.Error != nil && shouldSkipCredentialCooldown(res.Error) {
+		return
+	}
+
+	s.cache.CompareAndDelete(cacheKey, res.AuthID)
+	if fallbackKey != "" {
+		s.cache.CompareAndDelete(fallbackKey, res.AuthID)
 	}
 }
 

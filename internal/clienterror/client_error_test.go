@@ -1,8 +1,11 @@
 package clienterror
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"testing"
 )
 
@@ -13,6 +16,94 @@ type statusError struct {
 
 func (e statusError) Error() string   { return e.body }
 func (e statusError) StatusCode() int { return e.status }
+
+func TestHTTPStatusFromError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "nil", err: nil, want: 0},
+		{name: "plain error", err: errors.New("boom"), want: 0},
+		{name: "context canceled", err: context.Canceled, want: StatusClientClosedRequest},
+		{name: "context deadline exceeded", err: context.DeadlineExceeded, want: http.StatusGatewayTimeout},
+		{
+			name: "url error wraps canceled",
+			err:  &url.Error{Op: "Post", URL: "https://example.com", Err: context.Canceled},
+			want: StatusClientClosedRequest,
+		},
+		{
+			name: "url error wraps deadline",
+			err:  &url.Error{Op: "Post", URL: "https://example.com", Err: context.DeadlineExceeded},
+			want: http.StatusGatewayTimeout,
+		},
+		{
+			name: "fmt wrap canceled",
+			err:  fmt.Errorf("upstream: %w", context.Canceled),
+			want: StatusClientClosedRequest,
+		},
+		{
+			name: "explicit status code wins",
+			err:  statusError{status: http.StatusTooManyRequests, body: "rate limited"},
+			want: http.StatusTooManyRequests,
+		},
+		{
+			name: "explicit status wins over canceled unwrap",
+			err: statusAndUnwrapError{
+				status: http.StatusTooManyRequests,
+				body:   "rate limited",
+				cause:  context.Canceled,
+			},
+			want: http.StatusTooManyRequests,
+		},
+		{
+			name: "zero status code falls through to canceled unwrap",
+			err: statusAndUnwrapError{
+				status: 0,
+				body:   "canceled",
+				cause:  context.Canceled,
+			},
+			want: StatusClientClosedRequest,
+		},
+		{
+			name: "zero status code without unwrap stays unknown",
+			err:  statusError{status: 0, body: context.Canceled.Error()},
+			want: 0,
+		},
+		{
+			name: "wrapped status code via errors.As",
+			err:  fmt.Errorf("execute failed: %w", statusError{status: http.StatusUnauthorized, body: "unauthorized"}),
+			want: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HTTPStatusFromError(tc.err); got != tc.want {
+				t.Fatalf("HTTPStatusFromError() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	if got := HTTPStatusFromErrorOr(errors.New("boom"), http.StatusBadGateway); got != http.StatusBadGateway {
+		t.Fatalf("HTTPStatusFromErrorOr(plain) = %d, want %d", got, http.StatusBadGateway)
+	}
+	if got := HTTPStatusFromErrorOr(context.Canceled, http.StatusBadGateway); got != StatusClientClosedRequest {
+		t.Fatalf("HTTPStatusFromErrorOr(canceled) = %d, want %d", got, StatusClientClosedRequest)
+	}
+}
+
+type statusAndUnwrapError struct {
+	status int
+	body   string
+	cause  error
+}
+
+func (e statusAndUnwrapError) Error() string { return e.body }
+func (e statusAndUnwrapError) StatusCode() int {
+	return e.status
+}
+func (e statusAndUnwrapError) Unwrap() error { return e.cause }
 
 func TestIsRequestFaultStructuredIdentifiers(t *testing.T) {
 	for _, code := range []string{
@@ -100,6 +191,24 @@ func TestIsRequestFault(t *testing.T) {
 		},
 		{name: "plain not found", status: http.StatusNotFound, err: errors.New("model not found")},
 		{name: "unauthorized", status: http.StatusUnauthorized, err: errors.New("invalid token")},
+		{
+			name:   "deepseek authentication failure is credential failure",
+			status: http.StatusUnauthorized,
+			err:    errors.New(`{"error":{"code":"invalid_request_error","message":"Authentication Fails, Your api key: ****heck is invalid","param":null,"type":"authentication_error"}}`),
+			want:   false,
+		},
+		{
+			name:   "deepseek insufficient balance is payment failure",
+			status: http.StatusPaymentRequired,
+			err:    errors.New(`{"error":{"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}`),
+			want:   false,
+		},
+		{
+			name:   "rate limit status overrides generic request error code",
+			status: http.StatusTooManyRequests,
+			err:    errors.New(`{"error":{"message":"Rate Limit Reached","type":"unknown_error","param":null,"code":"invalid_request_error"}}`),
+			want:   false,
+		},
 		{name: "quota", status: http.StatusTooManyRequests, err: errors.New("quota")},
 		{name: "transport", status: http.StatusBadGateway, err: errors.New("unexpected EOF")},
 		{name: "invalid JSON body", status: http.StatusBadGateway, err: errors.New(`{"error":`)},
@@ -110,6 +219,36 @@ func TestIsRequestFault(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := IsRequestFault(tc.status, tc.err); got != tc.want {
 				t.Fatalf("IsRequestFault(%d, %v) = %t, want %t", tc.status, tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsClientCancellation(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		err    error
+		want   bool
+	}{
+		{name: "status 499", status: StatusClientClosedRequest, want: true},
+		{name: "context canceled error", status: 0, err: context.Canceled, want: true},
+		{name: "fmt wrapped context canceled", status: 0, err: fmt.Errorf("read: %w", context.Canceled), want: true},
+		{name: "context canceled string in error", status: 0, err: errors.New("upstream failed: context canceled"), want: true},
+		{name: "client closed request string in error", status: 0, err: errors.New("client closed request"), want: true},
+		{name: "statusCoder with 499", status: 0, err: statusError{status: StatusClientClosedRequest, body: "aborted"}, want: true},
+		{name: "status 200 without error", status: http.StatusOK, err: nil, want: false},
+		{name: "status 400 bad request", status: http.StatusBadRequest, err: errors.New("bad request"), want: false},
+		{name: "status 429 rate limit", status: http.StatusTooManyRequests, err: errors.New("rate limited"), want: false},
+		{name: "status 500 internal error", status: http.StatusInternalServerError, err: errors.New("internal error"), want: false},
+		{name: "plain unrelated error", status: 0, err: errors.New("connection reset by peer"), want: false},
+		{name: "nil error and 0 status", status: 0, err: nil, want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsClientCancellation(tc.status, tc.err); got != tc.want {
+				t.Fatalf("IsClientCancellation(%d, %v) = %t, want %t", tc.status, tc.err, got, tc.want)
 			}
 		})
 	}

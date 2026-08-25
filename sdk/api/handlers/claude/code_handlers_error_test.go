@@ -173,3 +173,21 @@ func TestWriteAuthenticationErrorUsesClaudeEnvelope(t *testing.T) {
 		t.Fatalf("request ID body=%q header=%q", requestID, recorder.Header().Get(claudeRequestIDHeader))
 	}
 }
+
+func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
+	wantErr := &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      errors.New(`{"error":{"message":"Your input exceeds the context window of this model. Please adjust your input and try again.","type":"invalid_request_error","code":"context_too_large"}}`),
+	}
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	errs <- wantErr
+	close(errs)
+
+	gotErr, ok := handlers.PendingStreamError(errs)
+	if !ok {
+		t.Fatal("expected pending stream error")
+	}
+	if gotErr != wantErr {
+		t.Fatalf("pending error = %p, want %p", gotErr, wantErr)
+	}
+}

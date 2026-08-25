@@ -26,13 +26,23 @@ type handlerInterceptorTestHost struct {
 	interceptResponse          func(context.Context, pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse
 	interceptStreamChunk       func(context.Context, pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse
 	completeRequest            func(context.Context, pluginapi.RequestCompletion)
+	// includeStreamChunkRequestBodies simulates legacy schema_version < 3 plugins.
+	includeStreamChunkRequestBodies bool
 }
 
 type handlerInterceptorNoStreamTestHost struct {
 	*handlerInterceptorTestHost
 }
 
+type handlerInterceptorDisabledRequestTestHost struct {
+	*handlerInterceptorTestHost
+}
+
 func (h *handlerInterceptorNoStreamTestHost) HasStreamInterceptors() bool {
+	return false
+}
+
+func (h *handlerInterceptorDisabledRequestTestHost) HasRequestInterceptors() bool {
 	return false
 }
 
@@ -80,6 +90,15 @@ func (h *handlerInterceptorTestHost) CompleteRequest(ctx context.Context, comple
 	if h != nil && h.completeRequest != nil {
 		h.completeRequest(ctx, completion)
 	}
+}
+
+// StreamChunkPayloadIncludesRequestBody implements streamChunkRequestBodyPolicy.
+// Default false simulates schema_version >= 3 (omit request bodies on payload chunks).
+func (h *handlerInterceptorTestHost) StreamChunkPayloadIncludesRequestBody() bool {
+	if h == nil {
+		return false
+	}
+	return h.includeStreamChunkRequestBodies
 }
 
 type interceptorCaptureExecutor struct {
@@ -555,6 +574,80 @@ func TestHandlerRequestInterceptorRewritesExecutorRequest(t *testing.T) {
 	}
 }
 
+func TestHandlerSkipsDisabledRequestInterceptorsWithoutCopyingPayload(t *testing.T) {
+	payload := []byte(`{"model":"disabled-interceptor-model"}`)
+	called := false
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	handler.SetPluginHost(&handlerInterceptorDisabledRequestTestHost{
+		handlerInterceptorTestHost: &handlerInterceptorTestHost{
+			interceptRequestBeforeAuth: func(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+				called = true
+				return pluginapi.RequestInterceptResponse{Body: []byte(`{"unexpected":true}`)}
+			},
+		},
+	})
+
+	req := coreexecutor.Request{Model: "disabled-interceptor-model", Payload: payload}
+	opts := coreexecutor.Options{OriginalRequest: payload}
+	gotReq, gotOpts, err := handler.applyRequestInterceptorsBeforeAuth(context.Background(), "openai", req.Model, "test-req", req, opts, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if called {
+		t.Fatal("disabled request interceptor was called")
+	}
+	if len(gotReq.Payload) != len(payload) || &gotReq.Payload[0] != &payload[0] {
+		t.Fatal("request payload was copied")
+	}
+	if len(gotOpts.OriginalRequest) != len(payload) || &gotOpts.OriginalRequest[0] != &payload[0] {
+		t.Fatal("original request was copied")
+	}
+}
+
+func BenchmarkHandlerRequestInterceptors(b *testing.B) {
+	sizes := []struct {
+		name  string
+		bytes int
+	}{
+		{name: "1KiB", bytes: 1 << 10},
+		{name: "1MiB", bytes: 1 << 20},
+		{name: "8MiB", bytes: 8 << 20},
+	}
+	hosts := []struct {
+		name string
+		host PluginInterceptorHost
+	}{
+		{
+			name: "disabled",
+			host: &handlerInterceptorDisabledRequestTestHost{
+				handlerInterceptorTestHost: &handlerInterceptorTestHost{},
+			},
+		},
+		{name: "active", host: &handlerInterceptorTestHost{}},
+	}
+
+	for _, size := range sizes {
+		payload := make([]byte, size.bytes)
+		req := coreexecutor.Request{Model: "benchmark-model", Payload: payload}
+		opts := coreexecutor.Options{OriginalRequest: payload}
+		for _, host := range hosts {
+			b.Run(host.name+"/"+size.name, func(b *testing.B) {
+				handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+				handler.SetPluginHost(host.host)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					gotReq, gotOpts, _ := handler.applyRequestInterceptorsBeforeAuth(context.Background(), "openai", req.Model, "benchmark-req", req, opts, "")
+					if len(gotReq.Payload) != size.bytes || len(gotOpts.OriginalRequest) != size.bytes {
+						b.Fatal("request payload length changed")
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestHandlerRequestInterceptorEmptyBodyKeepsOriginalPayload(t *testing.T) {
 	model := "handler-interceptor-empty-body-model"
 	executor := &interceptorCaptureExecutor{}
@@ -721,6 +814,41 @@ func TestHandlerResponseInterceptorRewritesSuccessfulNonStreamResponse(t *testin
 	}
 	if responseCalls != 1 {
 		t.Fatalf("response interceptor calls = %d, want 1", responseCalls)
+	}
+}
+
+func TestHandlerResponseInterceptorReceivesAuthEnrichedMetadata(t *testing.T) {
+	const model = "gpt-4o"
+	executor := &interceptorCaptureExecutor{
+		execute: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+			return coreexecutor.Response{Payload: []byte("upstream-body")}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{})
+	responseChecked := false
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptRequestAfterAuth: func(_ context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+			req.Metadata["after_auth_marker"] = "selected"
+			return pluginapi.RequestInterceptResponse{Headers: cloneHeader(req.Headers), Body: cloneBytes(req.Body)}
+		},
+		interceptResponse: func(_ context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+			responseChecked = true
+			if got := req.Metadata[coreexecutor.SelectedAuthMetadataKey]; got != "handler-interceptor-gpt-4o" {
+				t.Fatalf("response selected auth metadata = %#v", got)
+			}
+			if got := req.Metadata["after_auth_marker"]; got != "selected" {
+				t.Fatalf("response after-auth metadata = %#v", got)
+			}
+			return pluginapi.ResponseInterceptResponse{Body: cloneBytes(req.Body)}
+		},
+	})
+
+	_, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", model, []byte(`{"model":"gpt-4o"}`), "")
+	if errMsg != nil {
+		t.Fatalf("ExecuteWithAuthManager error = %#v", errMsg)
+	}
+	if !responseChecked {
+		t.Fatal("response interceptor was not called")
 	}
 }
 
@@ -905,16 +1033,22 @@ func TestHandlerStreamInterceptorRewritesAndDropsChunks(t *testing.T) {
 			if req.RequestHeaders.Get("X-Stage") != "after" {
 				t.Fatalf("stream request headers = %#v, want after-auth header", req.RequestHeaders)
 			}
-			if string(req.OriginalRequest) != `{"stage":"after-stream"}` {
-				t.Fatalf("stream original request = %q, want after-auth body", req.OriginalRequest)
-			}
-			if string(req.RequestBody) != `{"stage":"after-stream"}` {
-				t.Fatalf("stream request body = %q, want after-auth body", req.RequestBody)
-			}
 			if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+				if string(req.OriginalRequest) != `{"stage":"after-stream"}` {
+					t.Fatalf("stream original request = %q, want after-auth body", req.OriginalRequest)
+				}
+				if string(req.RequestBody) != `{"stage":"after-stream"}` {
+					t.Fatalf("stream request body = %q, want after-auth body", req.RequestBody)
+				}
 				headers := cloneHeader(req.ResponseHeaders)
 				headers.Set("X-Stream", "plugin")
 				return pluginapi.StreamChunkInterceptResponse{Headers: headers}
+			}
+			if len(req.OriginalRequest) != 0 {
+				t.Fatalf("payload chunk OriginalRequest = %q, want omitted for schema v3+", req.OriginalRequest)
+			}
+			if len(req.RequestBody) != 0 {
+				t.Fatalf("payload chunk RequestBody = %q, want omitted for schema v3+", req.RequestBody)
 			}
 			if req.ResponseHeaders.Get("X-Upstream") != "stream" {
 				t.Fatalf("stream response headers = %#v, want upstream header", req.ResponseHeaders)
@@ -954,6 +1088,108 @@ func TestHandlerStreamInterceptorRewritesAndDropsChunks(t *testing.T) {
 	}
 	if streamCalls != 4 {
 		t.Fatalf("stream interceptor calls = %d, want 4", streamCalls)
+	}
+}
+
+func TestHandlerStreamInterceptorReceivesAuthEnrichedMetadataForEveryChunk(t *testing.T) {
+	const model = "gpt-4o"
+	executor := &interceptorCaptureExecutor{
+		stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 2)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("first")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("second")}
+			close(chunks)
+			return &coreexecutor.StreamResult{Chunks: chunks}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{})
+	var indexes []int
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptRequestAfterAuth: func(_ context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+			req.Metadata["after_auth_marker"] = "selected"
+			return pluginapi.RequestInterceptResponse{Headers: cloneHeader(req.Headers), Body: cloneBytes(req.Body)}
+		},
+		interceptStreamChunk: func(_ context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			indexes = append(indexes, req.ChunkIndex)
+			if got := req.Metadata[coreexecutor.SelectedAuthMetadataKey]; got != "handler-interceptor-gpt-4o" {
+				t.Fatalf("chunk %d selected auth metadata = %#v", req.ChunkIndex, got)
+			}
+			if got := req.Metadata["after_auth_marker"]; got != "selected" {
+				t.Fatalf("chunk %d after-auth metadata = %#v", req.ChunkIndex, got)
+			}
+			return pluginapi.StreamChunkInterceptResponse{Body: cloneBytes(req.Body)}
+		},
+	})
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(`{"model":"gpt-4o","stream":true}`), "")
+	for range dataChan {
+	}
+	for errMsg := range errChan {
+		if errMsg != nil {
+			t.Fatalf("unexpected stream error: %#v", errMsg)
+		}
+	}
+	if len(indexes) != 3 || indexes[0] != pluginapi.StreamChunkHeaderInitIndex || indexes[1] != 0 || indexes[2] != 1 {
+		t.Fatalf("interceptor chunk indexes = %#v, want header initialization followed by both payloads", indexes)
+	}
+}
+
+func TestHandlerStreamInterceptorLegacySchemaClonesRequestBodiesOnPayloadChunks(t *testing.T) {
+	model := "handler-interceptor-stream-legacy-clone-model"
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 2)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("first")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("second")}
+			close(chunks)
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": []string{"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+	var payloadBodies [][]byte
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		includeStreamChunkRequestBodies: true,
+		interceptRequestAfterAuth: func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+			return pluginapi.RequestInterceptResponse{Body: []byte(`{"stage":"legacy-stream"}`)}
+		},
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+				if string(req.OriginalRequest) != `{"stage":"legacy-stream"}` || string(req.RequestBody) != `{"stage":"legacy-stream"}` {
+					t.Fatalf("header-init bodies = original:%q body:%q", req.OriginalRequest, req.RequestBody)
+				}
+				// Mutate delivered slices; later chunks must not observe this mutation.
+				req.OriginalRequest[0] = 'X'
+				req.RequestBody[0] = 'Y'
+				return pluginapi.StreamChunkInterceptResponse{}
+			}
+			if string(req.OriginalRequest) != `{"stage":"legacy-stream"}` {
+				t.Fatalf("payload OriginalRequest = %q, want isolated clone of after-auth body", req.OriginalRequest)
+			}
+			if string(req.RequestBody) != `{"stage":"legacy-stream"}` {
+				t.Fatalf("payload RequestBody = %q, want isolated clone of after-auth body", req.RequestBody)
+			}
+			payloadBodies = append(payloadBodies, req.OriginalRequest)
+			req.OriginalRequest[0] = 'Z'
+			return pluginapi.StreamChunkInterceptResponse{Body: req.Body}
+		},
+	})
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+	for range dataChan {
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if len(payloadBodies) != 2 {
+		t.Fatalf("payload body deliveries = %d, want 2", len(payloadBodies))
+	}
+	if &payloadBodies[0][0] == &payloadBodies[1][0] {
+		t.Fatal("payload OriginalRequest slices alias across chunks; want fresh clones")
 	}
 }
 

@@ -286,6 +286,8 @@ func mapAnthropicStopReasonToOpenAI(anthropicReason string) string {
 		return "length"
 	case "stop_sequence":
 		return "stop"
+	case "refusal", "sensitive":
+		return "content_filter"
 	default:
 		return "stop"
 	}
@@ -428,7 +430,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 	if len(reasoningParts) > 0 {
 		reasoningContent := strings.Join(reasoningParts, "")
 		// Add reasoning as a separate field in the message
-		out, _ = sjson.SetBytes(out, "choices.0.message.reasoning", reasoningContent)
+		out, _ = sjson.SetBytes(out, "choices.0.message.reasoning_content", reasoningContent)
 	}
 
 	// Set tool calls if any were accumulated during processing

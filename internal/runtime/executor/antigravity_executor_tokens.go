@@ -61,7 +61,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	if errReplay != nil {
 		return cliproxyexecutor.Response{}, errReplay
 	}
-	payload = preparedPayload
+	payload = ensureAntigravityGeminiLeadingUserContent(baseModel, preparedPayload)
 
 	payload = helps.DeleteJSONField(payload, "project")
 	payload = helps.DeleteJSONField(payload, "model")
@@ -99,7 +99,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		if errReq != nil {
 			return cliproxyexecutor.Response{}, errReq
 		}
-		httpReq.Close = true
+		// No httpReq.Close: keep the shared Antigravity connection pool usable.
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
