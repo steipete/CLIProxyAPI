@@ -210,6 +210,8 @@ type ModelAlias struct {
 	Name string
 	// Alias is the host-facing model alias.
 	Alias string
+	// Template is the catalogue model cloned when the provider model is hidden.
+	Template string
 }
 
 // AuthData describes a plugin provider auth record exchanged with the host.

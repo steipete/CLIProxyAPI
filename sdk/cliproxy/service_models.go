@@ -28,6 +28,9 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	if ctx.Err() != nil {
 		return
 	}
+	if s.coreManager != nil {
+		s.coreManager.SetValidatedOAuthModelAliases(a.ID, nil)
+	}
 	if a.Disabled {
 		GlobalModelRegistry().UnregisterClient(a.ID)
 		return
@@ -262,7 +265,11 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	if ctx.Err() != nil {
 		return
 	}
-	models = applyOAuthModelAliasForAuth(s.cfg, provider, authKind, a.Attributes, models)
+	var validatedAliases []config.OAuthModelAlias
+	models, validatedAliases = applyOAuthModelAliasForAuthWithValidation(s.cfg, provider, authKind, a.Attributes, models)
+	if s.coreManager != nil {
+		s.coreManager.SetValidatedOAuthModelAliases(a.ID, validatedAliases)
+	}
 	if ctx.Err() != nil {
 		return
 	}
@@ -891,18 +898,23 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 }
 
 func applyOAuthModelAliasForAuth(cfg *config.Config, provider, authKind string, attributes map[string]string, models []*ModelInfo) []*ModelInfo {
+	aliasedModels, _ := applyOAuthModelAliasForAuthWithValidation(cfg, provider, authKind, attributes, models)
+	return aliasedModels
+}
+
+func applyOAuthModelAliasForAuthWithValidation(cfg *config.Config, provider, authKind string, attributes map[string]string, models []*ModelInfo) ([]*ModelInfo, []config.OAuthModelAlias) {
 	if len(models) == 0 {
-		return models
+		return models, nil
 	}
 	channel := coreauth.OAuthModelAliasChannel(provider, authKind)
 	if channel == "" {
-		return models
+		return models, nil
 	}
 	aliases := oauthModelAliasesForAuth(cfg, channel, attributes)
 	if len(aliases) == 0 {
-		return models
+		return models, nil
 	}
-	return applyOAuthModelAliasEntries(aliases, models)
+	return applyOAuthModelAliasEntriesWithValidation(aliases, models)
 }
 
 func oauthModelAliasesForAuth(cfg *config.Config, channel string, attributes map[string]string) []config.OAuthModelAlias {
@@ -939,6 +951,11 @@ func oauthModelAliasesForAuth(cfg *config.Config, channel string, attributes map
 }
 
 func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*ModelInfo) []*ModelInfo {
+	aliasedModels, _ := applyOAuthModelAliasEntriesWithValidation(aliases, models)
+	return aliasedModels
+}
+
+func applyOAuthModelAliasEntriesWithValidation(aliases []config.OAuthModelAlias, models []*ModelInfo) ([]*ModelInfo, []config.OAuthModelAlias) {
 	type aliasEntry struct {
 		alias       string
 		displayName string
@@ -946,6 +963,17 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 	}
 
 	forward := make(map[string][]aliasEntry, len(aliases))
+	catalogue := make(map[string]*ModelInfo, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if id := strings.ToLower(strings.TrimSpace(model.ID)); id != "" {
+			if _, exists := catalogue[id]; !exists {
+				catalogue[id] = model
+			}
+		}
+	}
 	for i := range aliases {
 		name := strings.TrimSpace(aliases[i].Name)
 		alias := strings.TrimSpace(aliases[i].Alias)
@@ -963,10 +991,19 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 		})
 	}
 	if len(forward) == 0 {
-		return models
+		return models, nil
 	}
 
 	out := make([]*ModelInfo, 0, len(models))
+	validated := make([]config.OAuthModelAlias, 0, len(aliases))
+	for _, entry := range aliases {
+		if strings.TrimSpace(entry.Template) == "" {
+			continue
+		}
+		if _, sourceExists := catalogue[strings.ToLower(strings.TrimSpace(entry.Name))]; sourceExists {
+			validated = append(validated, entry)
+		}
+	}
 	seen := make(map[string]struct{}, len(models))
 	for _, model := range models {
 		if model == nil {
@@ -1035,5 +1072,39 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 			out = append(out, model)
 		}
 	}
-	return out
+	for i := range aliases {
+		entry := aliases[i]
+		name := strings.TrimSpace(entry.Name)
+		alias := strings.TrimSpace(entry.Alias)
+		template := strings.TrimSpace(entry.Template)
+		if name == "" || alias == "" || template == "" || strings.EqualFold(name, alias) {
+			continue
+		}
+		if _, sourceExists := catalogue[strings.ToLower(name)]; sourceExists {
+			continue
+		}
+		aliasKey := strings.ToLower(alias)
+		if _, catalogueCollision := catalogue[aliasKey]; catalogueCollision {
+			continue
+		}
+		if _, aliasCollision := seen[aliasKey]; aliasCollision {
+			continue
+		}
+		templateModel := catalogue[strings.ToLower(template)]
+		if templateModel == nil {
+			continue
+		}
+		clone := *templateModel
+		clone.ID = alias
+		if displayName := strings.TrimSpace(entry.DisplayName); displayName != "" {
+			clone.DisplayName = displayName
+		}
+		if clone.Name != "" {
+			clone.Name = rewriteModelInfoName(clone.Name, templateModel.ID, alias)
+		}
+		seen[aliasKey] = struct{}{}
+		out = append(out, &clone)
+		validated = append(validated, entry)
+	}
+	return out, validated
 }

@@ -90,6 +90,7 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 			clean = append(clean, OAuthModelAlias{
 				Name:         name,
 				Alias:        alias,
+				Template:     strings.TrimSpace(entry.Template),
 				Fork:         entry.Fork,
 				DisplayName:  strings.TrimSpace(entry.DisplayName),
 				ForceMapping: entry.ForceMapping,

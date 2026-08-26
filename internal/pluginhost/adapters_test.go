@@ -191,7 +191,7 @@ func TestRegisterModelsUsesModelProviderStaticModels(t *testing.T) {
 					if req.Host.AuthDir != "/tmp/plugin-auth" || req.Host.ProxyURL != "http://proxy.local" || !req.Host.ForceModelPrefix {
 						t.Fatalf("StaticModels host = %#v, want configured summary", req.Host)
 					}
-					if len(req.Host.OAuthModelAlias["plugin-provider"]) != 1 || req.Host.OAuthModelAlias["plugin-provider"][0].Alias != "alias-model" {
+					if len(req.Host.OAuthModelAlias["plugin-provider"]) != 1 || req.Host.OAuthModelAlias["plugin-provider"][0].Alias != "alias-model" || req.Host.OAuthModelAlias["plugin-provider"][0].Template != "visible-model" {
 						t.Fatalf("StaticModels OAuthModelAlias = %#v, want configured alias", req.Host.OAuthModelAlias)
 					}
 					if len(req.Host.ExcludedModels["plugin-provider"]) != 1 || req.Host.ExcludedModels["plugin-provider"][0] != "hidden-model" {
@@ -217,7 +217,7 @@ func TestRegisterModelsUsesModelProviderStaticModels(t *testing.T) {
 		},
 		AuthDir: "/tmp/plugin-auth",
 		OAuthModelAlias: map[string][]config.OAuthModelAlias{
-			"plugin-provider": []config.OAuthModelAlias{{Name: "upstream-model", Alias: "alias-model"}},
+			"plugin-provider": []config.OAuthModelAlias{{Name: "upstream-model", Alias: "alias-model", Template: "visible-model"}},
 		},
 		OAuthExcludedModels: map[string][]string{
 			"plugin-provider": []string{"hidden-model"},

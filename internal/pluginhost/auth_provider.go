@@ -56,7 +56,11 @@ func pluginOAuthModelAliases(in map[string][]config.OAuthModelAlias) map[string]
 			if name == "" || value == "" {
 				continue
 			}
-			out[key] = append(out[key], pluginapi.ModelAlias{Name: name, Alias: value})
+			out[key] = append(out[key], pluginapi.ModelAlias{
+				Name:     name,
+				Alias:    value,
+				Template: strings.TrimSpace(alias.Template),
+			})
 		}
 	}
 	if len(out) == 0 {

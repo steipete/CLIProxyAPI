@@ -612,7 +612,13 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 }
 
 func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {
-	if registryRef == nil || auth == nil {
+	if auth == nil {
+		return true
+	}
+	if !m.oauthModelAliasRequestAllowed(auth, routeModel) {
+		return false
+	}
+	if registryRef == nil {
 		return true
 	}
 	routeKey := canonicalModelKey(routeModel)
@@ -1220,7 +1226,8 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 	if auth == nil || strings.TrimSpace(routeModel) == "" {
 		return false
 	}
-	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
+	return !m.oauthModelAliasRequestAllowed(auth, routeModel) ||
+		m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
 }
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
