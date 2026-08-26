@@ -53,7 +53,7 @@ rollback() {
   exit 1
 }
 
-sed -i "s|^ExecStart=.*|ExecStart=$LIB/cli-proxy-api -config $CONFIG -local-model|" "$UNIT"
+sed -i "s|^ExecStart=.*|ExecStart=$LIB/cli-proxy-api -config $CONFIG|" "$UNIT"
 systemctl --user daemon-reload
 systemctl --user restart "$SERVICE"
 sleep 3
@@ -65,10 +65,12 @@ journalctl --user -u "$SERVICE" --since "30 seconds ago" --no-pager | grep -q "V
 KEY=$(python3 -c "
 import yaml,sys
 print((yaml.safe_load(open('$CONFIG')).get('api-keys') or [''])[0])")
-CODE=$(curl -s --max-time 60 -o /dev/null -w "%{http_code}" \
-  http://127.0.0.1:18081/v1/messages?beta=true \
-  -H "x-api-key: $KEY" -H "content-type: application/json" \
-  -d '{"model":"claude-fable-5","max_tokens":16,"messages":[{"role":"user","content":"Reply with exactly: OK"}]}')
-[ "$CODE" = "200" ] || rollback
+for MODEL in claude-fable-5 codex-latest gpt-5.6-sol; do
+  CODE=$(curl -s --max-time 60 -o /dev/null -w "%{http_code}" \
+    http://127.0.0.1:18081/v1/messages?beta=true \
+    -H "x-api-key: $KEY" -H "content-type: application/json" \
+    -d "{\"model\":\"$MODEL\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}]}")
+  [ "$CODE" = "200" ] || rollback
+done
 
-echo "deployed $VER ($SHA) — health check passed (HTTP $CODE)"
+echo "deployed $VER ($SHA) — Claude and subscription route health checks passed (HTTP $CODE)"
