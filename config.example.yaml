@@ -604,8 +604,8 @@ nonstream-keepalive-interval: 0
 # With codex.disable-codex-cloaking: true, `user-agent` overrides the downstream User-Agent
 # for HTTP and WebSocket requests; an existing upstream User-Agent still takes precedence.
 # `beta-features` only fills a missing WebSocket header.
-# The built-in identity uses the headless Codex execution client and carries the CLI version in User-Agent.
-# No Version header is added by default; an explicit downstream Version is preserved.
+# The built-in identity uses the headless Codex execution client and sends the CLI version in both
+# User-Agent and Version. Explicit downstream identity headers remain preserved.
 # codex-header-defaults:
 #   user-agent: "codex_exec/0.150.0-alpha.13 (Mac OS 27.0.0; arm64) unknown"
 #   beta-features: "multi_agent"

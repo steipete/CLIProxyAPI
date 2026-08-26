@@ -989,8 +989,8 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
 	}
-	if got := headers.Get("Version"); got != "" {
-		t.Fatalf("Version = %q, want empty", got)
+	if got := headers.Get("Version"); got != codexClientVersion {
+		t.Fatalf("Version = %q, want %q", got, codexClientVersion)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
@@ -1669,6 +1669,9 @@ func TestApplyCodexHeaders_EmptyAPIKey_OmitsAuthorizationAndOAuthHeaders(t *test
 	if got := req.Header.Get("Originator"); got != "" {
 		t.Fatalf("Originator = %q, want empty for API key auth_kind when client originator omitted", got)
 	}
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty for API key auth_kind", got)
+	}
 	if got := req.Header.Get("User-Agent"); got == "oauth-default-ua" {
 		t.Fatalf("User-Agent unexpectedly used OAuth default UA %q for API key auth_kind", got)
 	}
@@ -1703,6 +1706,9 @@ func TestApplyCodexWebsocketHeaders_EmptyAPIKey_OmitsAuthorizationAndOAuthHeader
 	}
 	if got := headers.Get("Originator"); got != "" {
 		t.Fatalf("Originator = %q, want empty for API key auth_kind", got)
+	}
+	if got := headers.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty for API key auth_kind", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty for API key auth_kind", got)
@@ -1857,7 +1863,10 @@ func TestApplyCodexHeadersDefaultOAuthIdentity(t *testing.T) {
 				if got := headers.Get("Originator"); got != "codex_exec" {
 					t.Fatalf("Originator = %q, want codex_exec", got)
 				}
-				for _, key := range []string{"Version", "X-Codex-Turn-Metadata", "X-Client-Request-Id"} {
+				if got := headers.Get("Version"); got != codexClientVersion {
+					t.Fatalf("Version = %q, want %q", got, codexClientVersion)
+				}
+				for _, key := range []string{"X-Codex-Turn-Metadata", "X-Client-Request-Id"} {
 					if values, ok := headers[key]; ok {
 						t.Errorf("%s = %q, want absent", key, values)
 					}
