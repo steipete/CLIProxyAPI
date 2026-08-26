@@ -552,7 +552,11 @@ func (s *Service) tryRegisterPluginModelsForAuth(ctx context.Context, a *coreaut
 		return true
 	}
 	models := applyExcludedModels(result.Models, activeExcluded)
-	models = applyOAuthModelAliasForAuth(s.cfg, providerKey, activeAuthKind, activeAuth.Attributes, models)
+	var validatedAliases []config.OAuthModelAlias
+	models, validatedAliases = applyOAuthModelAliasForAuthWithValidation(s.cfg, providerKey, activeAuthKind, activeAuth.Attributes, models)
+	if s.coreManager != nil {
+		s.coreManager.SetValidatedOAuthModelAliases(activeAuth.ID, validatedAliases)
+	}
 	if len(models) > 0 {
 		s.registerResolvedModelsForAuth(activeAuth, providerKey, applyModelPrefixes(models, activeAuth.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		return true

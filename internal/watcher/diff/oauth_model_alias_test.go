@@ -24,3 +24,18 @@ func TestDiffOAuthModelAliasChanges_IncludesDisplayName(t *testing.T) {
 		t.Fatalf("expected antigravity to be affected, got %#v", affected)
 	}
 }
+
+func TestDiffOAuthModelAliasChanges_IncludesTemplate(t *testing.T) {
+	oldMap := map[string][]config.OAuthModelAlias{
+		"codex": {{Name: "hidden-codex-model", Alias: "codex-latest", Template: "gpt-5.6-sol"}},
+	}
+	newMap := map[string][]config.OAuthModelAlias{
+		"codex": {{Name: "hidden-codex-model", Alias: "codex-latest", Template: "another-visible-model"}},
+	}
+
+	changes, affected := DiffOAuthModelAliasChanges(oldMap, newMap)
+	expectContains(t, changes, "oauth-model-alias[codex]: updated (1 -> 1 entries)")
+	if len(affected) != 1 || affected[0] != "codex" {
+		t.Fatalf("expected codex to be affected, got %#v", affected)
+	}
+}

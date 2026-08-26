@@ -138,6 +138,21 @@ PackyCode provides special discounts for our software users: register using <a h
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
+### OAuth aliases for unlisted models
+
+OAuth providers can accept an upstream model without including it in their model catalogue. Add a `template` to either a provider-wide `oauth-model-alias` entry or an individual OAuth credential's `model_aliases` metadata to expose a public alias using the capabilities of a catalogue-visible model:
+
+```yaml
+oauth-model-alias:
+  codex:
+    - name: hidden-codex-model
+      alias: codex-latest
+      template: gpt-5.6-sol
+      force-mapping: true
+```
+
+The proxy advertises `codex-latest`, clones the context limits and other capabilities from `gpt-5.6-sol`, and sends `hidden-codex-model` upstream. The upstream name is never added to model discovery; `force-mapping` also rewrites response model fields to the public alias. A template must already be visible in the same provider credential's catalogue, and per-credential aliases never authorize other credentials. Existing aliases without `template` are unchanged, and an existing source model always supplies its own capabilities.
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)

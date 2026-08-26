@@ -249,12 +249,13 @@ type RoutingConfig struct {
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
 // It maps the upstream model name (Name) to the client-visible alias (Alias).
-// When Fork is true, the alias is added as an additional model in listings while
-// keeping the original model ID available.
+// Template supplies catalogue capabilities when the upstream model is not listed.
+// When Fork is true, an existing upstream model remains available alongside its alias.
 type OAuthModelAlias struct {
-	Name  string `yaml:"name" json:"name"`
-	Alias string `yaml:"alias" json:"alias"`
-	Fork  bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
+	Name     string `yaml:"name" json:"name"`
+	Alias    string `yaml:"alias" json:"alias"`
+	Template string `yaml:"template,omitempty" json:"template,omitempty"`
+	Fork     bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
 
 	// DisplayName is the optional human-readable name shown in model catalogs.
 	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`

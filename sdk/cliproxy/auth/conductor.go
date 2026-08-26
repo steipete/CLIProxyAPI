@@ -139,6 +139,8 @@ type Manager struct {
 
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
+	// validatedOAuthModelAliases contains template-backed aliases proven against each auth catalogue.
+	validatedOAuthModelAliases sync.Map
 
 	// apiKeyModelRouting atomically publishes per-auth aliases and configured capabilities.
 	apiKeyModelRouting atomic.Value

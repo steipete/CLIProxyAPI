@@ -80,6 +80,9 @@ func summarizeOAuthModelAliasList(list []config.OAuthModelAlias) OAuthModelAlias
 			continue
 		}
 		key := name + "->" + aliasVal
+		if template := strings.ToLower(strings.TrimSpace(alias.Template)); template != "" {
+			key += "|template=" + template
+		}
 		if alias.Fork {
 			key += "|fork"
 		}

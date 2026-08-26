@@ -20,6 +20,7 @@ type modelAliasEntry interface {
 type oauthModelAliasEntry struct {
 	upstreamModel string
 	configAlias   string
+	template      string
 	forceMapping  bool
 }
 
@@ -64,6 +65,7 @@ func compileOAuthModelAliasTable(aliases map[string][]internalconfig.OAuthModelA
 			rev[aliasKey] = oauthModelAliasEntry{
 				upstreamModel: name,
 				configAlias:   alias,
+				template:      strings.TrimSpace(entry.Template),
 				forceMapping:  entry.ForceMapping,
 			}
 		}
@@ -90,6 +92,79 @@ func (m *Manager) SetOAuthModelAlias(aliases map[string][]internalconfig.OAuthMo
 		table = &oauthModelAliasTable{}
 	}
 	m.oauthModelAlias.Store(table)
+}
+
+// SetValidatedOAuthModelAliases replaces the catalogue-proven template aliases for one credential.
+func (m *Manager) SetValidatedOAuthModelAliases(authID string, aliases []internalconfig.OAuthModelAlias) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	validated := make(map[string]oauthModelAliasEntry, len(aliases))
+	for _, alias := range aliases {
+		name := strings.TrimSpace(alias.Name)
+		value := strings.TrimSpace(alias.Alias)
+		template := strings.TrimSpace(alias.Template)
+		if name == "" || value == "" || template == "" {
+			continue
+		}
+		validated[strings.ToLower(value)] = oauthModelAliasEntry{
+			upstreamModel: name,
+			configAlias:   value,
+			template:      template,
+		}
+	}
+	if len(validated) == 0 {
+		m.validatedOAuthModelAliases.Delete(authID)
+		return
+	}
+	m.validatedOAuthModelAliases.Store(authID, validated)
+}
+
+func (m *Manager) oauthModelAliasEntryValidated(auth *Auth, alias, name, template string) bool {
+	if strings.TrimSpace(template) == "" {
+		return true
+	}
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return false
+	}
+	raw, exists := m.validatedOAuthModelAliases.Load(auth.ID)
+	if !exists {
+		return false
+	}
+	validated, ok := raw.(map[string]oauthModelAliasEntry)
+	if !ok {
+		return false
+	}
+	entry, exists := validated[strings.ToLower(strings.TrimSpace(alias))]
+	return exists && strings.EqualFold(entry.upstreamModel, strings.TrimSpace(name)) &&
+		strings.EqualFold(entry.template, strings.TrimSpace(template))
+}
+
+func (m *Manager) oauthModelAliasRequestAllowed(auth *Auth, requestedModel string) bool {
+	channel := modelAliasChannel(auth)
+	if m == nil || channel == "" {
+		return true
+	}
+	_, candidates := modelAliasLookupCandidates(requestedModel)
+	perAuthAliases := OAuthModelAliasesFromAttributes(authAttributes(auth))
+	for _, candidate := range candidates {
+		for _, entry := range perAuthAliases {
+			if strings.EqualFold(strings.TrimSpace(entry.Alias), strings.TrimSpace(candidate)) {
+				return m.oauthModelAliasEntryValidated(auth, entry.Alias, entry.Name, entry.Template)
+			}
+		}
+	}
+	raw := m.oauthModelAlias.Load()
+	table, _ := raw.(*oauthModelAliasTable)
+	if table == nil || table.reverse == nil {
+		return true
+	}
+	for _, candidate := range candidates {
+		if entry, exists := table.reverse[channel][strings.ToLower(strings.TrimSpace(candidate))]; exists {
+			return m.oauthModelAliasEntryValidated(auth, entry.configAlias, entry.upstreamModel, entry.template)
+		}
+	}
+	return true
 }
 
 // applyOAuthModelAlias resolves the upstream model from OAuth model alias.
@@ -262,7 +337,7 @@ func (m *Manager) resolveOAuthUpstreamModel(auth *Auth, requestedModel string) s
 
 func (m *Manager) resolveOAuthModelAliasWithResult(auth *Auth, requestedModel string) OAuthModelAliasResult {
 	channel := modelAliasChannel(auth)
-	if channel == "" {
+	if channel == "" || !m.oauthModelAliasRequestAllowed(auth, requestedModel) {
 		return OAuthModelAliasResult{}
 	}
 	if result := resolveUpstreamModelFromAliases(OAuthModelAliasesFromAttributes(authAttributes(auth)), requestedModel); result.UpstreamModel != "" {
