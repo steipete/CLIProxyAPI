@@ -986,12 +986,6 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	if !strings.HasPrefix(codexUserAgent, codexOriginator+"/") {
 		t.Fatalf("default Codex User-Agent = %s, want prefix %s/", codexUserAgent, codexOriginator)
 	}
-	if !strings.HasPrefix(codexUserAgent, "codex-tui/") {
-		t.Fatalf("default Codex User-Agent = %s, want codex-tui prefix", codexUserAgent)
-	}
-	if !strings.Contains(codexUserAgent, "(codex-tui;") {
-		t.Fatalf("default Codex User-Agent = %s, want codex-tui suffix", codexUserAgent)
-	}
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
 	}
@@ -1794,6 +1788,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	}
 	req = req.WithContext(contextWithGinHeaders(map[string]string{
 		"Originator":            "Codex Desktop",
+		"User-Agent":            "codex_cli_rs/0.1.0",
 		"Version":               "0.115.0-alpha.27",
 		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
@@ -1804,6 +1799,9 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 
 	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
+	}
+	if got := req.Header.Get("User-Agent"); got != "codex_cli_rs/0.1.0" {
+		t.Fatalf("User-Agent = %s, want %s", got, "codex_cli_rs/0.1.0")
 	}
 	if got := req.Header.Get("Version"); got != "0.115.0-alpha.27" {
 		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
@@ -1816,22 +1814,56 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	}
 }
 
-func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) {
-	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
-	if err != nil {
-		t.Fatalf("NewRequest() error = %v", err)
+func TestApplyCodexHeadersDefaultOAuthIdentity(t *testing.T) {
+	const wantUserAgent = "codex_cli_rs/0.150.0-alpha.13 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"email": "user@example.com"},
 	}
-
-	applyCodexHeaders(req, nil, "oauth-token", true, nil)
-
-	if got := req.Header.Get("Version"); got != "" {
-		t.Fatalf("Version = %q, want empty", got)
+	configs := []struct {
+		name string
+		cfg  *config.Config
+	}{
+		{name: "no config"},
+		{name: "default cloaking", cfg: &config.Config{}},
+		{name: "cloaking disabled", cfg: &config.Config{Codex: config.CodexConfig{DisableCodexCloaking: true}}},
 	}
-	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "" {
-		t.Fatalf("X-Codex-Turn-Metadata = %q, want empty", got)
+	transports := []struct {
+		name  string
+		apply func(*config.Config) http.Header
+	}{
+		{
+			name: "HTTP",
+			apply: func(cfg *config.Config) http.Header {
+				req := httptest.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+				applyCodexHeaders(req, auth, "oauth-token", true, cfg)
+				return req.Header
+			},
+		},
+		{
+			name: "WebSocket",
+			apply: func(cfg *config.Config) http.Header {
+				return applyCodexWebsocketHeaders(context.Background(), nil, auth, "oauth-token", cfg)
+			},
+		},
 	}
-	if got := req.Header.Get("X-Client-Request-Id"); got != "" {
-		t.Fatalf("X-Client-Request-Id = %q, want empty", got)
+	for _, transport := range transports {
+		for _, tt := range configs {
+			t.Run(transport.name+"/"+tt.name, func(t *testing.T) {
+				headers := transport.apply(tt.cfg)
+				if got := headers.Get("User-Agent"); got != wantUserAgent {
+					t.Fatalf("User-Agent = %q, want %q", got, wantUserAgent)
+				}
+				if got := headers.Get("Originator"); got != "codex_cli_rs" {
+					t.Fatalf("Originator = %q, want codex_cli_rs", got)
+				}
+				for _, key := range []string{"Version", "X-Codex-Turn-Metadata", "X-Client-Request-Id"} {
+					if values, ok := headers[key]; ok {
+						t.Errorf("%s = %q, want absent", key, values)
+					}
+				}
+			})
+		}
 	}
 }
 
