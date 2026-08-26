@@ -387,6 +387,17 @@ func normalizeCodexInstructions(body []byte) []byte {
 	return body
 }
 
+func applyCodexSourceRequestCompatibility(body []byte, from sdktranslator.Format, auth *cliproxyauth.Auth) []byte {
+	body = applyCodexSourceInstructions(body, from)
+	if !sourceFormatEqual(from, sdktranslator.FormatClaude) || auth == nil || auth.AuthKind() != cliproxyauth.AuthKindOAuth {
+		return body
+	}
+	if gjson.GetBytes(body, "max_output_tokens").Exists() {
+		body, _ = sjson.DeleteBytes(body, "max_output_tokens")
+	}
+	return body
+}
+
 func applyCodexSourceInstructions(body []byte, from sdktranslator.Format) []byte {
 	body = normalizeCodexInstructions(body)
 	if !sourceFormatEqual(from, sdktranslator.FormatClaude) {
