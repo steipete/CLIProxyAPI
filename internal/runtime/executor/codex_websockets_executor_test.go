@@ -1815,7 +1815,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 }
 
 func TestApplyCodexHeadersDefaultOAuthIdentity(t *testing.T) {
-	const wantUserAgent = "codex_cli_rs/0.150.0-alpha.13 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
+	const wantUserAgent = "codex_exec/0.150.0-alpha.13 (Mac OS 27.0.0; arm64) unknown"
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
 		Metadata: map[string]any{"email": "user@example.com"},
@@ -1854,8 +1854,8 @@ func TestApplyCodexHeadersDefaultOAuthIdentity(t *testing.T) {
 				if got := headers.Get("User-Agent"); got != wantUserAgent {
 					t.Fatalf("User-Agent = %q, want %q", got, wantUserAgent)
 				}
-				if got := headers.Get("Originator"); got != "codex_cli_rs" {
-					t.Fatalf("Originator = %q, want codex_cli_rs", got)
+				if got := headers.Get("Originator"); got != "codex_exec" {
+					t.Fatalf("Originator = %q, want codex_exec", got)
 				}
 				for _, key := range []string{"Version", "X-Codex-Turn-Metadata", "X-Client-Request-Id"} {
 					if values, ok := headers[key]; ok {
