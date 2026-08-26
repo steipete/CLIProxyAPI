@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	codexUserAgent                        = "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
-	codexOriginator                       = "codex-tui"
+	codexClientVersion                    = "0.150.0-alpha.13"
+	codexUserAgent                        = "codex_exec/" + codexClientVersion + " (Mac OS 27.0.0; arm64) unknown"
+	codexOriginator                       = "codex_exec"
 	codexDefaultImageToolModel            = "gpt-image-2"
 	codexResponsesLiteHeader              = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata            = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
@@ -329,10 +330,15 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		r.Header.Del("Authorization")
 	}
 
+	isAPIKey := codexAuthUsesAPIKey(auth)
 	if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
 	}
-	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
+	versionFallback := codexClientVersion
+	if isAPIKey {
+		versionFallback = ""
+	}
+	misc.EnsureHeader(r.Header, ginHeaders, "Version", versionFallback)
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
@@ -350,7 +356,6 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	}
 	r.Header.Set("Connection", "Keep-Alive")
 
-	isAPIKey := codexAuthUsesAPIKey(auth)
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		r.Header.Set("Originator", originator)
 	} else if !isAPIKey {

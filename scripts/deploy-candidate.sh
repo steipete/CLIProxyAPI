@@ -59,7 +59,10 @@ systemctl --user restart "$SERVICE"
 sleep 3
 
 systemctl --user is-active --quiet "$SERVICE" || rollback
-journalctl --user -u "$SERVICE" --since "30 seconds ago" --no-pager | grep -q "Version: $VER" || rollback
+JOURNAL=$(mktemp)
+trap 'rm -f "$JOURNAL"' EXIT
+journalctl --user -u "$SERVICE" --since "30 seconds ago" --no-pager >"$JOURNAL"
+grep -q "Version: $VER" "$JOURNAL" || rollback
 
 # Real request through the freshly flipped service; key never printed.
 KEY=$(python3 -c "
@@ -70,7 +73,10 @@ for MODEL in claude-fable-5 codex-latest gpt-5.6-sol; do
     http://127.0.0.1:18081/v1/messages?beta=true \
     -H "x-api-key: $KEY" -H "content-type: application/json" \
     -d "{\"model\":\"$MODEL\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}]}")
-  [ "$CODE" = "200" ] || rollback
+  if [ "$CODE" != "200" ]; then
+    echo "health check failed for public route $MODEL (HTTP $CODE)" >&2
+    rollback
+  fi
 done
 
 echo "deployed $VER ($SHA) — Claude and subscription route health checks passed (HTTP $CODE)"
