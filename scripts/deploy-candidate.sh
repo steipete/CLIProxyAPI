@@ -73,7 +73,10 @@ for MODEL in claude-fable-5 codex-latest gpt-5.6-sol; do
     http://127.0.0.1:18081/v1/messages?beta=true \
     -H "x-api-key: $KEY" -H "content-type: application/json" \
     -d "{\"model\":\"$MODEL\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}]}")
-  [ "$CODE" = "200" ] || rollback
+  if [ "$CODE" != "200" ]; then
+    echo "health check failed for public route $MODEL (HTTP $CODE)" >&2
+    rollback
+  fi
 done
 
 echo "deployed $VER ($SHA) — Claude and subscription route health checks passed (HTTP $CODE)"
