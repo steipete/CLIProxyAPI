@@ -59,7 +59,10 @@ systemctl --user restart "$SERVICE"
 sleep 3
 
 systemctl --user is-active --quiet "$SERVICE" || rollback
-journalctl --user -u "$SERVICE" --since "30 seconds ago" --no-pager | grep -q "Version: $VER" || rollback
+JOURNAL=$(mktemp)
+trap 'rm -f "$JOURNAL"' EXIT
+journalctl --user -u "$SERVICE" --since "30 seconds ago" --no-pager >"$JOURNAL"
+grep -q "Version: $VER" "$JOURNAL" || rollback
 
 # Real request through the freshly flipped service; key never printed.
 KEY=$(python3 -c "
