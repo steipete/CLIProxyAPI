@@ -19,11 +19,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Refresh models catalog
-        run: bash .github/scripts/refresh-model-catalogs.sh
       - name: Build
         run: |
           go build -o test-output ./cmd/server
           rm -f test-output
       - name: Test
         run: go test ./...
+      # Unit tests assert the checked-in catalog. Keep live catalog refreshes
+      # out of their inputs, while still checking the release build with fresh data.
+      - name: Refresh models catalog
+        run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Build with refreshed catalog
+        run: |
+          go build -o test-output ./cmd/server
+          rm -f test-output
